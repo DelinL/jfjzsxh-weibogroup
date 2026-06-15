@@ -185,42 +185,11 @@ def download_file(fid: str, url: str, media_type: int,
         return {"status": "failed", "local_path": "", "file_size": 0, "md5": ""}
 
 
-def _mark_videos_skipped() -> int:
-    """把所有 pending 状态的视频 (media_type ∈ VIDEO_MEDIA_TYPES) 标记为 skipped，
-    使其不再进入下载队列。返回处理的条数。
-
-    skipped 与 done/failed 同级，仅作「主动放弃」的语义标记，
-    --download 时会被 get_pending_media 过滤掉，不会重复尝试。
-    """
-    from .types import VIDEO_MEDIA_TYPES
-    conn = get_conn()
-    placeholders = ",".join("?" * len(VIDEO_MEDIA_TYPES))
-    cursor = conn.execute(
-        f"UPDATE media_files SET status='skipped' "
-        f"WHERE status='pending' AND media_type IN ({placeholders})",
-        tuple(VIDEO_MEDIA_TYPES),
-    )
-    conn.commit()
-    return cursor.rowcount
-
-
-def download_pending(limit: int = 10, cookie: str = "",
-                     skip_video: bool = False):
-    """下载 pending 状态的媒体文件
-
-    Args:
-        skip_video: True 时把所有视频 (media_type ∈ {10,13}) 直接标 skipped，
-                    不下载（视频体积大，避免占存储）。
-    """
+def download_pending(limit: int = 10, cookie: str = ""):
+    """下载 pending 状态的媒体文件"""
     if cookie:
         set_cookie(cookie)
     get_cookie_or_default()  # 确保 cookie 被加载
-
-    if skip_video:
-        n = _mark_videos_skipped()
-        if n > 0:
-            log.info("跳过视频: %d 个标记为 skipped", n)
-
     files = get_pending_media(limit)
     for f in files:
         result = download_file(f["fid"], f["orig_url"], f["media_type"])

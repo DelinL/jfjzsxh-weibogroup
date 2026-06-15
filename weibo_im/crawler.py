@@ -539,20 +539,14 @@ class Crawler:
                  boundary["sender"] or "(空)", boundary["text"] or "(空)")
         return boundary
 
-    def download_all_media(self, skip_video: bool = False):
-        """下载所有待处理的媒体文件（逐个下载直到队列清空）
-
-        Args:
-            skip_video: True 时跳过视频 (media_type ∈ {10,13})，直接标 skipped。
-        """
+    def download_all_media(self):
+        """下载所有待处理的媒体文件（逐个下载直到队列清空）"""
         total = 0
         while True:
-            count = download_pending(limit=10, skip_video=skip_video)
+            count = download_pending(limit=10)
             if count == 0:
                 break
             total += count
-            # 首轮已处理 skip_video，后续轮次无需再标记
-            skip_video = False
             _jitter_sleep(0.3)
         if total > 0:
             log.info("媒体下载完成: %d 个", total)

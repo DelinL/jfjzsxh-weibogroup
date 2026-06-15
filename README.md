@@ -143,8 +143,7 @@ python crawl.py
 | 命令 | 作用 |
 |------|------|
 | `python crawl.py --download` | 下载所有 `pending` 状态的媒体文件直到队列清空。 |
-| `python crawl.py --download --no-video` | 下载所有 pending 媒体，但**跳过视频**（media_type 10/13），把它们标记为 `skipped` 不占存储。 |
-| `python crawl.py --download-fid 5302496155143676` | 下载指定 fid 的单个媒体文件（包括 `--no-video` 跳过的视频，按需补单个）。 |
+| `python crawl.py --download-fid 5302496155143676` | 下载指定 fid 的单个媒体文件。 |
 
 > 爬取时**不自动下载媒体**——只把 fid/url 写入 `media_files` 表（status=`pending`）。
 > 外部链接文件（PDF/ZIP 等）由 `scan_links` 扫描近期消息识别，仅在

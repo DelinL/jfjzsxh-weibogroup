@@ -280,8 +280,6 @@ def main():
                         help="全文搜索消息（FTS5 关键词）")
     parser.add_argument("--search-limit", type=int, default=50,
                         help="--search 的最大返回条数（默认 50）")
-    parser.add_argument("--no-video", action="store_true",
-                        help="下载媒体时跳过视频 (media_type 10/13)，直接标 skipped 不占存储")
     args = parser.parse_args()
 
     level = logging.DEBUG if args.verbose else logging.INFO
@@ -359,7 +357,6 @@ def main():
         log.info("  媒体已下载:   %d", s["media_done"])
         log.info("  媒体待下载:   %d", s["media_pending"])
         log.info("  媒体失败:     %d", s["media_failed"])
-        log.info("  媒体跳过:     %d", s["media_skipped"])
         return
 
     if args.list_groups:
@@ -400,15 +397,11 @@ def main():
 
     # --download: 下载所有 pending 媒体文件
     if args.download:
-        if args.no_video:
-            log.info("下载所有 pending 媒体文件（跳过视频）...")
-        else:
-            log.info("下载所有 pending 媒体文件...")
-        crawler.download_all_media(skip_video=args.no_video)
+        log.info("下载所有 pending 媒体文件...")
+        crawler.download_all_media()
         stats = crawler.stats()
-        log.info("媒体统计: %d done, %d pending, %d failed, %d skipped",
-                 stats["media_done"], stats["media_pending"],
-                 stats["media_failed"], stats["media_skipped"])
+        log.info("媒体统计: %d done, %d pending, %d failed",
+                 stats["media_done"], stats["media_pending"], stats["media_failed"])
         return
 
     # --probe-boundary: 盲测最早边界

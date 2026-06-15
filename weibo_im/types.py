@@ -63,7 +63,3 @@ def is_redpacket(msg: dict) -> bool:
     """media_type=13 时判断是否红包"""
     content = msg.get("content", "")
     return "收到红包消息" in content
-
-
-# 视频媒体类型集合（体积大，可配置跳过下载）
-VIDEO_MEDIA_TYPES: set[int] = {10, 13}

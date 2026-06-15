@@ -479,7 +479,6 @@ def get_stats() -> dict:
     media_done = conn.execute("SELECT COUNT(*) FROM media_files WHERE status='done'").fetchone()[0]
     media_pending = conn.execute("SELECT COUNT(*) FROM media_files WHERE status='pending'").fetchone()[0]
     media_failed = conn.execute("SELECT COUNT(*) FROM media_files WHERE status='failed'").fetchone()[0]
-    media_skipped = conn.execute("SELECT COUNT(*) FROM media_files WHERE status='skipped'").fetchone()[0]
     return {
         "messages": msgs,
         "groups_with_msgs": groups,
@@ -487,5 +486,4 @@ def get_stats() -> dict:
         "media_done": media_done,
         "media_pending": media_pending,
         "media_failed": media_failed,
-        "media_skipped": media_skipped,
     }
