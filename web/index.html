@@ -1,5 +1,54 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><title>微博群聊消息查看器</title></head>
-<body>占位</body>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>微博群聊消息查看器</title>
+  <link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+  <div id="topbar">
+    <select id="group-select" title="选择群"></select>
+    <input id="search-input" type="search" placeholder="搜索关键词（最近3个月）…" autocomplete="off">
+    <select id="sender-select" title="按发送者筛选"></select>
+    <span id="status">加载中…</span>
+  </div>
+
+  <div id="main">
+    <aside id="sidebar">
+      <div id="date-jump">
+        <input id="date-picker" type="date" title="跳转到日期">
+      </div>
+      <div id="date-list"></div>
+    </aside>
+
+    <section id="viewer">
+      <div id="range-indicator"></div>
+      <div id="message-list">
+        <div id="sentinel-top"></div>
+        <div id="sentinel-bottom"></div>
+      </div>
+      <div id="empty-hint" hidden></div>
+    </section>
+  </div>
+
+  <!-- 搜索浮层 -->
+  <div id="search-overlay" hidden>
+    <div id="search-panel">
+      <div id="search-panel-head">
+        <span>搜索结果</span>
+        <select id="search-range" title="搜索时间范围">
+          <option value="7">最近1周</option>
+          <option value="30">最近1个月</option>
+          <option value="90" selected>最近3个月</option>
+        </select>
+        <button id="search-close" type="button">×</button>
+      </div>
+      <div id="search-status"></div>
+      <div id="search-results"></div>
+    </div>
+  </div>
+
+  <script src="/web/app.js"></script>
+</body>
 </html>
