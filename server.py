@@ -13,6 +13,11 @@ from urllib.parse import urlparse, parse_qs
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
+
+def _opt_int(qs, key):
+    v = qs.get(key, [None])[0]
+    return int(v) if v not in (None, "") else None
+
 # ---------- 数据库 ----------
 
 def open_db(db_path):
@@ -55,6 +60,89 @@ def query_senders(conn, gid):
     return [{"sender_id": r["sender_id"],
              "sender_name": r["sender_name"] or str(r["sender_id"]),
              "count": r["c"]} for r in rows]
+
+
+# messages 查询选取的列（供 row_to_msg 使用，保持一致）
+MSG_COLUMNS = (
+    "id, mid, gid, msg_type, msg_type_name, media_type, "
+    "sender_id, sender_name, text, fid, media_orig_url, "
+    "url_objects, pic_infos, template, template_data, recall_by, "
+    "group_name, created_at"
+)
+
+
+def row_to_msg(r):
+    return {
+        "id": r["id"],
+        "mid": r["mid"],
+        "gid": r["gid"],
+        "msg_type": r["msg_type"],
+        "msg_type_name": r["msg_type_name"],
+        "media_type": r["media_type"],
+        "sender_id": r["sender_id"],
+        "sender_name": r["sender_name"],
+        "text": r["text"],
+        "fid": r["fid"],
+        "media_orig_url": r["media_orig_url"],
+        "url_objects": r["url_objects"],
+        "pic_infos": r["pic_infos"],
+        "template": r["template"],
+        "template_data": r["template_data"],
+        "recall_by": r["recall_by"],
+        "group_name": r["group_name"],
+        "created_at": r["created_at"],
+    }
+
+
+def _has_more(conn, gid, sender_cond, sender_params, where_clause, params):
+    """检查指定方向是否还有更多消息。"""
+    sql = (f"SELECT 1 FROM messages WHERE gid=? {sender_cond} {where_clause} "
+           f"LIMIT 1")
+    return conn.execute(sql, (gid,) + sender_params + params).fetchone() is not None
+
+
+def query_messages(conn, gid, sender_id, before_ts, before_id,
+                   after_ts, after_id, limit):
+    """双向游标分页。before/after 二选一，无则从最旧开始升序取 limit。"""
+    sender_cond = ""
+    sender_params = ()
+    if sender_id:
+        sender_cond = "AND sender_id=?"
+        sender_params = (sender_id,)
+
+    where = ""
+    params = ()
+    if before_ts is not None:
+        where = ("AND (created_at < ? OR (created_at = ? AND id < ?))")
+        params = (before_ts, before_ts, before_id)
+    elif after_ts is not None:
+        where = ("AND (created_at > ? OR (created_at = ? AND id > ?))")
+        params = (after_ts, after_ts, after_id)
+
+    sql = (f"SELECT {MSG_COLUMNS} FROM messages "
+           f"WHERE gid=? {sender_cond} {where} "
+           f"ORDER BY created_at ASC, id ASC LIMIT ?")
+    rows = conn.execute(sql, (gid,) + sender_params + params + (limit,)).fetchall()
+    msgs = [row_to_msg(r) for r in rows]
+
+    if not msgs:
+        return {"messages": [], "oldest": None, "newest": None,
+                "has_more_older": False, "has_more_newer": False}
+
+    oldest = {"ts": msgs[0]["created_at"], "id": msgs[0]["id"]}
+    newest = {"ts": msgs[-1]["created_at"], "id": msgs[-1]["id"]}
+
+    has_more_older = _has_more(
+        conn, gid, sender_cond, sender_params,
+        "AND (created_at < ? OR (created_at = ? AND id < ?))",
+        (oldest["ts"], oldest["ts"], oldest["id"]))
+    has_more_newer = _has_more(
+        conn, gid, sender_cond, sender_params,
+        "AND (created_at > ? OR (created_at = ? AND id > ?))",
+        (newest["ts"], newest["ts"], newest["id"]))
+
+    return {"messages": msgs, "oldest": oldest, "newest": newest,
+            "has_more_older": has_more_older, "has_more_newer": has_more_newer}
 
 
 # ---------- HTTP Handler ----------
@@ -109,6 +197,17 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/senders":
                 gid = int(qs.get("gid", ["0"])[0])
                 self._send_json(query_senders(conn, gid))
+            elif path == "/api/messages":
+                gid = int(qs.get("gid", ["0"])[0])
+                sender_id = int(qs.get("sender_id", ["0"])[0]) or 0
+                limit = int(qs.get("limit", ["500"])[0])
+                before_ts = _opt_int(qs, "before_ts")
+                before_id = _opt_int(qs, "before_id")
+                after_ts = _opt_int(qs, "after_ts")
+                after_id = _opt_int(qs, "after_id")
+                self._send_json(query_messages(
+                    conn, gid, sender_id, before_ts, before_id,
+                    after_ts, after_id, limit))
             else:
                 self._send_json({"error": "not found"}, status=404)
         except Exception as e:

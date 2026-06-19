@@ -109,5 +109,74 @@ class MetadataApiTest(_ServerTestBase):
         ])
 
 
+class MessagesCursorTest(_ServerTestBase):
+    def make_data(self, conn):
+        conn.execute("INSERT INTO groups(gid,name) VALUES(100,'群A')")
+        # 5 条：ts 递增；m2/m3 同毫秒、m4/m5 同毫秒，测 tiebreaker
+        # id 顺序与 ts 顺序一致，便于预期
+        insert_messages(conn, [
+            {"mid": "m1", "gid": 100, "sender_id": 1, "text": "a", "created_at": 1000},
+            {"mid": "m2", "gid": 100, "sender_id": 1, "text": "b", "created_at": 2000},
+            {"mid": "m3", "gid": 100, "sender_id": 2, "text": "c", "created_at": 2000},
+            {"mid": "m4", "gid": 100, "sender_id": 1, "text": "d", "created_at": 3000},
+            {"mid": "m5", "gid": 100, "sender_id": 2, "text": "e", "created_at": 3000},
+        ])
+
+    def test_after_cursor_loads_newer(self):
+        # after 游标 = m2(ts=2000,id=2)，取更新：m3,m4,m5
+        path = "/api/messages?gid=100&after_ts=2000&after_id=2&limit=500"
+        status, data = self._get_json(path)
+        self.assertEqual(status, 200)
+        mids = [m["mid"] for m in data["messages"]]
+        self.assertEqual(mids, ["m3", "m4", "m5"])
+        self.assertFalse(data["has_more_newer"])
+        self.assertEqual(data["newest"], {"ts": 3000, "id": 5})
+
+    def test_before_cursor_loads_older(self):
+        # before 游标 = m4(ts=3000,id=4)，取更早：m1,m2,m3（升序）
+        path = "/api/messages?gid=100&before_ts=3000&before_id=4&limit=500"
+        status, data = self._get_json(path)
+        self.assertEqual(status, 200)
+        mids = [m["mid"] for m in data["messages"]]
+        self.assertEqual(mids, ["m1", "m2", "m3"])
+        self.assertFalse(data["has_more_older"])
+        self.assertEqual(data["oldest"], {"ts": 1000, "id": 1})
+
+    def test_limit_caps_results_and_has_more(self):
+        # after=m1，limit=2，返回 m2,m3，has_more_newer=True
+        path = "/api/messages?gid=100&after_ts=1000&after_id=1&limit=2"
+        status, data = self._get_json(path)
+        self.assertEqual(status, 200)
+        mids = [m["mid"] for m in data["messages"]]
+        self.assertEqual(mids, ["m2", "m3"])
+        self.assertTrue(data["has_more_newer"])
+
+    def test_sender_filter(self):
+        # after=m1，只看 sender_id=2：m3,m5
+        path = "/api/messages?gid=100&after_ts=1000&after_id=1&sender_id=2&limit=500"
+        status, data = self._get_json(path)
+        self.assertEqual(status, 200)
+        mids = [m["mid"] for m in data["messages"]]
+        self.assertEqual(mids, ["m3", "m5"])
+
+    def test_no_cursor_returns_from_oldest(self):
+        path = "/api/messages?gid=100&limit=500"
+        status, data = self._get_json(path)
+        self.assertEqual(status, 200)
+        mids = [m["mid"] for m in data["messages"]]
+        self.assertEqual(mids, ["m1", "m2", "m3", "m4", "m5"])
+        self.assertFalse(data["has_more_older"])
+
+    def test_empty_when_no_match(self):
+        path = "/api/messages?gid=999&limit=500"
+        status, data = self._get_json(path)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["messages"], [])
+        self.assertIsNone(data["oldest"])
+        self.assertIsNone(data["newest"])
+        self.assertFalse(data["has_more_older"])
+        self.assertFalse(data["has_more_newer"])
+
+
 if __name__ == "__main__":
     unittest.main()
