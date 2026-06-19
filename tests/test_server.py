@@ -233,5 +233,56 @@ class AnchorApiTest(_ServerTestBase):
         self.assertTrue(data["has_more_newer"])
 
 
+class SearchApiTest(_ServerTestBase):
+    BASE = 1750113600000  # 2025-06-17 00:00 CST
+
+    def make_data(self, conn):
+        conn.execute("INSERT INTO groups(gid,name) VALUES(100,'群A')")
+        base = self.BASE
+        insert_messages(conn, [
+            {"mid": "s1", "gid": 100, "sender_id": 1, "sender_name": "甲",
+             "text": "今天天气不错", "created_at": base},
+            {"mid": "s2", "gid": 100, "sender_id": 2, "sender_name": "乙",
+             "text": "天气真好啊天气", "created_at": base + 1000},
+            {"mid": "s3", "gid": 100, "sender_id": 1, "sender_name": "甲",
+             "text": "含通配符 50% 折扣", "created_at": base + 2000},
+        ])
+
+    def test_search_basic(self):
+        from urllib.parse import quote
+        path = f"/api/search?gid=100&q={quote('天气')}&days=90&limit=200"
+        status, data = self._get_json(path)
+        self.assertEqual(status, 200)
+        mids = [r["mid"] for r in data["results"]]
+        self.assertEqual(mids, ["s2", "s1"])  # 倒序
+        self.assertIn("天气", data["results"][0]["snippet"])
+
+    def test_search_escapes_like_wildcards(self):
+        # 搜 "50%"，% 应被转义为字面量，只匹配 s3
+        from urllib.parse import quote
+        path = f"/api/search?gid=100&q={quote('50%')}&days=90&limit=200"
+        status, data = self._get_json(path)
+        self.assertEqual(status, 200)
+        mids = [r["mid"] for r in data["results"]]
+        self.assertEqual(mids, ["s3"])
+
+    def test_search_no_match(self):
+        from urllib.parse import quote
+        path = f"/api/search?gid=100&q={quote('不存在')}&days=90&limit=200"
+        status, data = self._get_json(path)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["results"], [])
+
+    def test_search_days_filter(self):
+        # days=0 → 下界=最新(s3, ts=base+2000)，只匹配 ts>=base+2000 的
+        # s1(base)、s2(base+1000) 被排除，s3 命中但不含"天气" → 空
+        from urllib.parse import quote
+        path = f"/api/search?gid=100&q={quote('天气')}&days=0&limit=200"
+        status, data = self._get_json(path)
+        self.assertEqual(status, 200)
+        mids = [r["mid"] for r in data["results"]]
+        self.assertEqual(mids, [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -199,6 +199,54 @@ def query_around(conn, gid, mid, limit):
     return _build_response(conn, msgs, gid, "", (), anchor_mid=mid)
 
 
+def _escape_like(s):
+    """转义 LIKE 通配符 % _ \\，配合 ESCAPE '\\' 使用。"""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _snippet(text, q, span=30):
+    """截取关键词前后各 span 字，关键词用 \\x00/\\x01 包裹供前端转 <mark>。"""
+    if not text:
+        return ""
+    idx = text.find(q)
+    if idx < 0:
+        return text[:span * 2]
+    start = max(0, idx - span)
+    end = min(len(text), idx + len(q) + span)
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(text) else ""
+    return (prefix + text[start:idx] + "\x00" + q + "\x01"
+            + text[idx + len(q):end] + suffix)
+
+
+def query_search(conn, gid, q, days, limit):
+    if not q:
+        return {"results": []}
+    # 该群最新消息时间作为范围上界基准
+    max_row = conn.execute(
+        "SELECT MAX(created_at) AS mx FROM messages WHERE gid=?", (gid,)).fetchone()
+    max_ts = max_row["mx"] if max_row and max_row["mx"] else 0
+    min_ts = max_ts - days * 86400000
+    like = "%" + _escape_like(q) + "%"
+    rows = conn.execute(
+        f"SELECT {MSG_COLUMNS} FROM messages WHERE gid=? "
+        f"AND created_at >= ? AND text LIKE ? ESCAPE '\\' "
+        f"ORDER BY created_at DESC, id DESC LIMIT ?",
+        (gid, min_ts, like, limit)).fetchall()
+    results = []
+    for r in rows:
+        m = row_to_msg(r)
+        results.append({
+            "mid": m["mid"],
+            "sender_id": m["sender_id"],
+            "sender_name": m["sender_name"] or str(m["sender_id"]),
+            "created_at": m["created_at"],
+            "text": m["text"],
+            "snippet": _snippet(m["text"], q),
+        })
+    return {"results": results}
+
+
 # ---------- HTTP Handler ----------
 
 class Handler(BaseHTTPRequestHandler):
@@ -273,6 +321,12 @@ class Handler(BaseHTTPRequestHandler):
                 mid = qs.get("mid", [""])[0]
                 limit = int(qs.get("limit", ["500"])[0])
                 self._send_json(query_around(conn, gid, mid, limit))
+            elif path == "/api/search":
+                gid = int(qs.get("gid", ["0"])[0])
+                q = qs.get("q", [""])[0]
+                days = int(qs.get("days", ["90"])[0])
+                limit = int(qs.get("limit", ["200"])[0])
+                self._send_json(query_search(conn, gid, q, days, limit))
             else:
                 self._send_json({"error": "not found"}, status=404)
         except Exception as e:
