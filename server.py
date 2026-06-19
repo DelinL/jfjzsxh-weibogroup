@@ -4,6 +4,7 @@
 启动：python server.py   访问：http://127.0.0.1:8765
 """
 import argparse
+import calendar
 import json
 import mimetypes
 import os
@@ -17,6 +18,26 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 def _opt_int(qs, key):
     v = qs.get(key, [None])[0]
     return int(v) if v not in (None, "") else None
+
+
+def _cst_month_bounds(month):
+    """CST(+8) 某月（YYYY-MM）的 [start_ms, end_ms) 时间戳区间。
+
+    created_at 存的是 UTC 毫秒，CST 整点零分对应 UTC-8h，故月首 CST 00:00
+    的 UTC 毫秒 = (calendar.timegm(月首) - 8*3600) * 1000。end 为次月首，开区间。
+    """
+    y, m = map(int, month.split("-"))
+    start_cst = calendar.timegm((y, m, 1, 0, 0, 0, 0, 0, 0))
+    ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
+    end_cst = calendar.timegm((ny, nm, 1, 0, 0, 0, 0, 0, 0))
+    return (start_cst - 8 * 3600) * 1000, (end_cst - 8 * 3600) * 1000
+
+
+def _cst_day_bounds(date):
+    """CST(+8) 某天（YYYY-MM-DD）的 [start_ms, end_ms) 时间戳区间。"""
+    y, m, d = map(int, date.split("-"))
+    start_cst = calendar.timegm((y, m, d, 0, 0, 0, 0, 0, 0))
+    return (start_cst - 8 * 3600) * 1000, (start_cst - 8 * 3600 + 86400) * 1000
 
 # ---------- 数据库 ----------
 
@@ -52,27 +73,20 @@ def query_dates(conn, gid):
 
 
 def query_month_days(conn, gid, month):
-    """指定月份（YYYY-MM）的每日消息数，倒序返回。点击展开月份时按需查。"""
+    """指定月份（YYYY-MM）的每日消息数，倒序返回。点击展开月份时按需查。
+
+    用 CST 月区间 [start_ms, end_ms) 做 created_at 范围过滤，命中
+    (gid, created_at) 复合索引；每日标签仍由 date() 表达式给出。
+    """
+    start_ms, end_ms = _cst_month_bounds(month)
     rows = conn.execute(
         "SELECT date(datetime(created_at/1000,'unixepoch','+8 hours')) AS d, "
         "COUNT(*) AS c FROM messages WHERE gid=? "
-        "AND strftime('%Y-%m', datetime(created_at/1000,'unixepoch','+8 hours'))=? "
+        "AND created_at>=? AND created_at<? "
         "GROUP BY d ORDER BY d DESC",
-        (gid, month),
+        (gid, start_ms, end_ms),
     ).fetchall()
     return [{"date": r["d"], "count": r["c"]} for r in rows]
-
-
-def query_senders(conn, gid):
-    rows = conn.execute(
-        "SELECT sender_id, sender_name, COUNT(*) AS c "
-        "FROM messages WHERE gid=? AND sender_id<>0 "
-        "GROUP BY sender_id ORDER BY c DESC, sender_id",
-        (gid,),
-    ).fetchall()
-    return [{"sender_id": r["sender_id"],
-             "sender_name": r["sender_name"] or str(r["sender_id"]),
-             "count": r["c"]} for r in rows]
 
 
 # messages 查询选取的列（供 row_to_msg 使用，保持一致）
@@ -108,51 +122,69 @@ def row_to_msg(r):
 
 
 def _has_more(conn, gid, sender_cond, sender_params, where_clause, params):
-    """检查指定方向是否还有更多消息。"""
+    """检查指定方向是否还有更多消息。
+
+    排序键仅为 created_at：同毫秒消息（多为抢红包）顺序不做保证，
+    重复/省略不影响阅读。游标用 created_at 单值，命中 (gid,created_at)
+    复合索引的范围扫描，无临时排序。
+    """
     sql = (f"SELECT 1 FROM messages WHERE gid=? {sender_cond} {where_clause} "
            f"LIMIT 1")
     return conn.execute(sql, (gid,) + sender_params + params).fetchone() is not None
 
 
-def query_messages(conn, gid, sender_id, before_ts, before_id,
-                   after_ts, after_id, limit):
-    """双向游标分页。before/after 二选一，无则从最旧开始升序取 limit。"""
+def query_messages(conn, gid, sender_name, before_ts, after_ts, limit):
+    """双向游标分页。before/after 二选一，无则从最旧开始升序取 limit。
+
+    排序键仅 created_at，游标用 created_at 单值。同毫秒消息（抢红包等）
+    顺序不保证且可能在分页边界重复，符合预期。不用入库自增 id（其顺序
+    与消息时间无关）。sender_name 非空时按 sender_name 精确匹配过滤。
+
+    方向：before_ts（取更旧）需用 DESC LIMIT 取紧邻游标的 limit 条再
+    反转为升序；after_ts/无游标用 ASC LIMIT。若 before 也用 ASC LIMIT，
+    会取到整个范围内最旧的 limit 条（远早于游标），导致向上加载跳到很早
+    的数据。
+    """
     sender_cond = ""
     sender_params = ()
-    if sender_id:
-        sender_cond = "AND sender_id=?"
-        sender_params = (sender_id,)
+    if sender_name:
+        sender_cond = "AND sender_name=?"
+        sender_params = (sender_name,)
 
     where = ""
     params = ()
+    order = "ASC"
+    reverse = False
     if before_ts is not None:
-        where = ("AND (created_at < ? OR (created_at = ? AND id < ?))")
-        params = (before_ts, before_ts, before_id)
+        where = "AND created_at < ?"
+        params = (before_ts,)
+        order = "DESC"   # 取紧邻游标的 limit 条
+        reverse = True   # 反转为升序返回
     elif after_ts is not None:
-        where = ("AND (created_at > ? OR (created_at = ? AND id > ?))")
-        params = (after_ts, after_ts, after_id)
+        where = "AND created_at > ?"
+        params = (after_ts,)
 
     sql = (f"SELECT {MSG_COLUMNS} FROM messages "
            f"WHERE gid=? {sender_cond} {where} "
-           f"ORDER BY created_at ASC, id ASC LIMIT ?")
+           f"ORDER BY created_at {order} LIMIT ?")
     rows = conn.execute(sql, (gid,) + sender_params + params + (limit,)).fetchall()
     msgs = [row_to_msg(r) for r in rows]
+    if reverse:
+        msgs.reverse()
 
     if not msgs:
         return {"messages": [], "oldest": None, "newest": None,
                 "has_more_older": False, "has_more_newer": False}
 
-    oldest = {"ts": msgs[0]["created_at"], "id": msgs[0]["id"]}
-    newest = {"ts": msgs[-1]["created_at"], "id": msgs[-1]["id"]}
+    oldest = {"ts": msgs[0]["created_at"]}
+    newest = {"ts": msgs[-1]["created_at"]}
 
     has_more_older = _has_more(
         conn, gid, sender_cond, sender_params,
-        "AND (created_at < ? OR (created_at = ? AND id < ?))",
-        (oldest["ts"], oldest["ts"], oldest["id"]))
+        "AND created_at < ?", (oldest["ts"],))
     has_more_newer = _has_more(
         conn, gid, sender_cond, sender_params,
-        "AND (created_at > ? OR (created_at = ? AND id > ?))",
-        (newest["ts"], newest["ts"], newest["id"]))
+        "AND created_at > ?", (newest["ts"],))
 
     return {"messages": msgs, "oldest": oldest, "newest": newest,
             "has_more_older": has_more_older, "has_more_newer": has_more_newer}
@@ -166,16 +198,14 @@ def _build_response(conn, msgs, gid, sender_cond, sender_params, anchor_mid=None
         if anchor_mid is not None:
             resp["anchor_mid"] = anchor_mid
         return resp
-    oldest = {"ts": msgs[0]["created_at"], "id": msgs[0]["id"]}
-    newest = {"ts": msgs[-1]["created_at"], "id": msgs[-1]["id"]}
+    oldest = {"ts": msgs[0]["created_at"]}
+    newest = {"ts": msgs[-1]["created_at"]}
     has_more_older = _has_more(
         conn, gid, sender_cond, sender_params,
-        "AND (created_at < ? OR (created_at = ? AND id < ?))",
-        (oldest["ts"], oldest["ts"], oldest["id"]))
+        "AND created_at < ?", (oldest["ts"],))
     has_more_newer = _has_more(
         conn, gid, sender_cond, sender_params,
-        "AND (created_at > ? OR (created_at = ? AND id > ?))",
-        (newest["ts"], newest["ts"], newest["id"]))
+        "AND created_at > ?", (newest["ts"],))
     resp = {"messages": msgs, "oldest": oldest, "newest": newest,
             "has_more_older": has_more_older, "has_more_newer": has_more_newer}
     if anchor_mid is not None:
@@ -183,32 +213,56 @@ def _build_response(conn, msgs, gid, sender_cond, sender_params, anchor_mid=None
     return resp
 
 
-def query_by_date(conn, gid, date, sender_id, limit):
-    """取某 CST 日期最新 limit 条，反转为升序返回。"""
-    sender_cond = "AND sender_id=?" if sender_id else ""
-    sender_params = (sender_id,) if sender_id else ()
+def query_by_date(conn, gid, date, sender_name, limit):
+    """取某 CST 日期最新 limit 条，反转为升序返回。
+
+    sender_name 非空时按 sender_name 精确匹配过滤。
+    用 CST 当日区间 [start_ms, end_ms) 做 created_at 范围过滤，命中
+    (gid, created_at) 复合索引。
+    """
+    sender_cond = "AND sender_name=?" if sender_name else ""
+    sender_params = (sender_name,) if sender_name else ()
+    start_ms, end_ms = _cst_day_bounds(date)
     sql = (f"SELECT {MSG_COLUMNS} FROM messages "
-           f"WHERE gid=? AND date(datetime(created_at/1000,'unixepoch','+8 hours'))=? "
-           f"{sender_cond} ORDER BY created_at DESC, id DESC LIMIT ?")
-    rows = conn.execute(sql, (gid, date) + sender_params + (limit,)).fetchall()
+           f"WHERE gid=? AND created_at>=? AND created_at<? "
+           f"{sender_cond} ORDER BY created_at DESC LIMIT ?")
+    rows = conn.execute(sql, (gid, start_ms, end_ms) + sender_params + (limit,)).fetchall()
     msgs = [row_to_msg(r) for r in rows]
     msgs.reverse()  # 反转为升序
     return _build_response(conn, msgs, gid, sender_cond, sender_params)
 
 
 def query_around(conn, gid, mid, limit):
-    """以 mid 对应消息为锚，取它及之前 limit 条，反转为升序返回。"""
+    """以 mid 对应消息为锚，取它之前 limit 条 + 锚点 + 之后 limit 条，升序返回。
+
+    limit 为单侧条数（前后各取 limit 条，含锚点共约 2*limit+1 条），
+    使命中消息大致位于返回列表中间，便于查看上下文。
+
+    排序键仅 created_at：锚点之前取 created_at < 锚点时间（倒序 limit 条），
+    锚点本身，之后取 created_at > 锚点时间（升序 limit 条）。同毫秒消息
+    （抢红包等）顺序不保证，锚点同毫秒的其它消息可能落在前或后任一侧。
+    """
     anchor = conn.execute(
         f"SELECT {MSG_COLUMNS} FROM messages WHERE mid=?", (mid,)).fetchone()
     if anchor is None:
         return _build_response(conn, [], gid, "", (), anchor_mid=mid)
     a = row_to_msg(anchor)
-    sql = (f"SELECT {MSG_COLUMNS} FROM messages WHERE gid=? "
-           f"AND (created_at < ? OR (created_at = ? AND id <= ?)) "
-           f"ORDER BY created_at DESC, id DESC LIMIT ?")
-    rows = conn.execute(sql, (gid, a["created_at"], a["created_at"], a["id"], limit)).fetchall()
-    msgs = [row_to_msg(r) for r in rows]
+    # 锚点之前 limit 条（不含锚点及同毫秒），倒序取再反转为升序
+    before_sql = (f"SELECT {MSG_COLUMNS} FROM messages WHERE gid=? "
+                  f"AND created_at < ? "
+                  f"ORDER BY created_at DESC LIMIT ?")
+    before_rows = conn.execute(
+        before_sql, (gid, a["created_at"], limit)).fetchall()
+    # 锚点之后 limit 条（不含锚点及同毫秒），升序取
+    after_sql = (f"SELECT {MSG_COLUMNS} FROM messages WHERE gid=? "
+                 f"AND created_at > ? "
+                 f"ORDER BY created_at ASC LIMIT ?")
+    after_rows = conn.execute(
+        after_sql, (gid, a["created_at"], limit)).fetchall()
+    msgs = [row_to_msg(r) for r in before_rows]
     msgs.reverse()
+    msgs += [a]
+    msgs += [row_to_msg(r) for r in after_rows]
     return _build_response(conn, msgs, gid, "", (), anchor_mid=mid)
 
 
@@ -218,9 +272,14 @@ def _escape_like(s):
 
 
 def _snippet(text, q, span=30):
-    """截取关键词前后各 span 字，关键词用 \\x00/\\x01 包裹供前端转 <mark>。"""
+    """截取关键词前后各 span 字，关键词用 \\x00/\\x01 包裹供前端转 <mark>。
+
+    q 为空（仅按发送者搜索）时返回文本前缀，不加高亮标记。
+    """
     if not text:
         return ""
+    if not q:
+        return text[:span * 2]
     idx = text.find(q)
     if idx < 0:
         return text[:span * 2]
@@ -232,20 +291,38 @@ def _snippet(text, q, span=30):
             + text[idx + len(q):end] + suffix)
 
 
-def query_search(conn, gid, q, days, limit):
-    if not q:
+def query_search(conn, gid, q, sender_name, start_ts, end_ts, limit):
+    """跨日期搜索消息。
+
+    - 仅 q（模糊关键词）：text LIKE，按时间倒序取最新 limit 条。
+    - 仅 sender_name（精确）：该发送者最新 limit 条。
+    - 两者皆有：sender_name 精确 AND text LIKE。
+    - 均空：返回空。
+    时间范围 [start_ts, end_ts) 均为 CST 当日零点对应的毫秒，开区间。
+    start_ts 为空表示不设下界，end_ts 为空表示不设上界。
+    snippet 用 _snippet 生成（无 q 时返回文本前缀，无高亮标记）。
+    """
+    if not q and not sender_name:
         return {"results": []}
-    # 该群最新消息时间作为范围上界基准
-    max_row = conn.execute(
-        "SELECT MAX(created_at) AS mx FROM messages WHERE gid=?", (gid,)).fetchone()
-    max_ts = max_row["mx"] if max_row and max_row["mx"] else 0
-    min_ts = max_ts - days * 86400000
-    like = "%" + _escape_like(q) + "%"
-    rows = conn.execute(
-        f"SELECT {MSG_COLUMNS} FROM messages WHERE gid=? "
-        f"AND created_at >= ? AND text LIKE ? ESCAPE '\\' "
-        f"ORDER BY created_at DESC, id DESC LIMIT ?",
-        (gid, min_ts, like, limit)).fetchall()
+    conds = ["gid=?"]
+    params = [gid]
+    if start_ts is not None:
+        conds.append("created_at >= ?")
+        params.append(start_ts)
+    if end_ts is not None:
+        conds.append("created_at < ?")
+        params.append(end_ts)
+    if sender_name:
+        conds.append("sender_name=?")
+        params.append(sender_name)
+    if q:
+        like = "%" + _escape_like(q) + "%"
+        conds.append("text LIKE ? ESCAPE '\\'")
+        params.append(like)
+    sql = (f"SELECT {MSG_COLUMNS} FROM messages WHERE "
+           + " AND ".join(conds) +
+           " ORDER BY created_at DESC LIMIT ?")
+    rows = conn.execute(sql, params + [limit]).fetchall()
     results = []
     for r in rows:
         m = row_to_msg(r)
@@ -313,26 +390,20 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(query_month_days(conn, gid, month))
                 else:
                     self._send_json(query_dates(conn, gid))
-            elif path == "/api/senders":
-                gid = int(qs.get("gid", ["0"])[0])
-                self._send_json(query_senders(conn, gid))
             elif path == "/api/messages":
                 gid = int(qs.get("gid", ["0"])[0])
-                sender_id = int(qs.get("sender_id", ["0"])[0]) or 0
+                sender_name = qs.get("sender_name", [""])[0] or ""
                 limit = int(qs.get("limit", ["500"])[0])
                 before_ts = _opt_int(qs, "before_ts")
-                before_id = _opt_int(qs, "before_id")
                 after_ts = _opt_int(qs, "after_ts")
-                after_id = _opt_int(qs, "after_id")
                 self._send_json(query_messages(
-                    conn, gid, sender_id, before_ts, before_id,
-                    after_ts, after_id, limit))
+                    conn, gid, sender_name, before_ts, after_ts, limit))
             elif path == "/api/messages/by_date":
                 gid = int(qs.get("gid", ["0"])[0])
                 date = qs.get("date", [""])[0]
-                sender_id = int(qs.get("sender_id", ["0"])[0]) or 0
+                sender_name = qs.get("sender_name", [""])[0] or ""
                 limit = int(qs.get("limit", ["500"])[0])
-                self._send_json(query_by_date(conn, gid, date, sender_id, limit))
+                self._send_json(query_by_date(conn, gid, date, sender_name, limit))
             elif path == "/api/messages/around":
                 gid = int(qs.get("gid", ["0"])[0])
                 mid = qs.get("mid", [""])[0]
@@ -341,9 +412,12 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/search":
                 gid = int(qs.get("gid", ["0"])[0])
                 q = qs.get("q", [""])[0]
-                days = int(qs.get("days", ["90"])[0])
-                limit = int(qs.get("limit", ["200"])[0])
-                self._send_json(query_search(conn, gid, q, days, limit))
+                sender_name = qs.get("sender_name", [""])[0]
+                start_ts = _opt_int(qs, "start_ts")
+                end_ts = _opt_int(qs, "end_ts")
+                limit = int(qs.get("limit", ["1000"])[0])
+                self._send_json(query_search(
+                    conn, gid, q, sender_name, start_ts, end_ts, limit))
             else:
                 self._send_json({"error": "not found"}, status=404)
         except Exception as e:

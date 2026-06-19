@@ -6,8 +6,6 @@ const state = {
   groups: [],
   dates: [],            // [{month:'YYYY-MM', days:[{date,count}], open:bool}]
   selectedDate: null,
-  selectedSender: null, // sender_id 或 null
-  senders: [],
   messages: [],         // 升序，最新在底
   before: null,         // {ts,id}
   after: null,          // {ts,id}
@@ -18,13 +16,12 @@ const state = {
   reqId: 0,
 };
 
-const LIMIT = 500;
+const LIMIT = 100;
 
 // ---------- DOM ----------
 const $ = (id) => document.getElementById(id);
 const elGroup = $("group-select");
-const elSender = $("sender-select");
-const elSearch = $("search-input");
+const elSearchBtn = $("search-btn");
 const elStatus = $("status");
 const elDateList = $("date-list");
 const elDatePicker = $("date-picker");
@@ -70,6 +67,16 @@ function fmtDate(ms) {
 function cstDate(ms) {
   // 与后端一致：UTC ms + 8h 取 YYYY-MM-DD
   return fmtDate(ms);
+}
+
+function dateStrToCstStartMs(dateStr) {
+  // 与后端 _cst_day_bounds 一致：CST 当日 00:00 对应的 UTC 毫秒。
+  // dateStr 为 'YYYY-MM-DD'，Date.UTC 得到该日 UTC 00:00 的 ms，
+  // 再减 8h 即为 CST 00:00 的 UTC ms。非法返回 null。
+  if (!dateStr) return null;
+  const [y, m, d] = dateStr.split("-").map(Number);
+  if (!y || !m || !d) return null;
+  return Date.UTC(y, m - 1, d) - 8 * 3600 * 1000;
 }
 
 // ---------- 消息渲染 ----------
@@ -223,12 +230,6 @@ async function loadGroups() {
     `<option value="${g.gid}">${escapeHtml(g.name)} (${g.msg_count})</option>`).join("");
 }
 
-async function loadSenders(gid) {
-  state.senders = await api(`/api/senders?gid=${gid}`);
-  elSender.innerHTML = `<option value="">全部发送者</option>` +
-    state.senders.map(s => `<option value="${s.sender_id}">${escapeHtml(s.sender_name)} (${s.count})</option>`).join("");
-}
-
 async function loadDates(gid) {
   const data = await api(`/api/dates?gid=${gid}`);
   // 按月聚合，倒序；days 初始为 null（点击展开才查）
@@ -244,11 +245,10 @@ async function loadMonthDays(month) {
   renderDateList();
 }
 
-async function loadByDate(gid, date, senderId) {
+async function loadByDate(gid, date) {
   const myReq = ++state.reqId;
   elStatus.textContent = "加载中…";
   let params = `gid=${gid}&date=${encodeURIComponent(date)}&limit=${LIMIT}`;
-  if (senderId) params += `&sender_id=${senderId}`;
   const data = await api(`/api/messages/by_date?${params}`);
   if (myReq !== state.reqId) return; // 已被新请求覆盖
   state.messages = data.messages;
@@ -257,18 +257,16 @@ async function loadByDate(gid, date, senderId) {
   state.hasMoreOlder = data.has_more_older;
   state.hasMoreNewer = data.has_more_newer;
   renderMessages(null);
-  elStatus.textContent = `共 ${state.messages.length} 条`;
   // 滚到底（最新在底）
   elMsgList.scrollTop = elMsgList.scrollHeight;
+  elStatus.textContent = "";
 }
 
 // ---------- 选择操作 ----------
 async function selectGroup(gid) {
   state.gid = gid;
-  state.selectedSender = null;
-  elSender.value = "";
   elStatus.textContent = "加载中…";
-  await Promise.all([loadDates(gid), loadSenders(gid)]);
+  await loadDates(gid);
   // 默认展开最近月 + 加载每日 + 选最新日期
   if (state.dates.length) {
     const latest = state.dates[0];
@@ -283,19 +281,30 @@ async function selectGroup(gid) {
 async function selectDate(date) {
   highlightDate(date);
   elDatePicker.value = date;
-  await loadByDate(state.gid, date, state.selectedSender);
+  await loadByDate(state.gid, date);
 }
 
 // ---------- 搜索 ----------
 const elOverlay = $("search-overlay");
-const elSearchRange = $("search-range");
+const elSearchStart = $("search-start");
+const elSearchEnd = $("search-end");
+const elSearchSender = $("search-sender");
+const elSearchKeyword = $("search-keyword");
+const elSearchSubmit = $("search-submit");
 const elSearchStatus = $("search-status");
 const elSearchResults = $("search-results");
 const elSearchClose = $("search-close");
 
 function openSearch() {
+  // 默认最近 30 天：起 = 今天往前30天，止 = 今天（CST 日期）
+  const todayCst = fmtDate(Date.now());
+  const todayMs = dateStrToCstStartMs(todayCst);
+  if (!elSearchStart.value) {
+    elSearchStart.value = fmtDate(todayMs - 30 * 86400000);
+  }
+  if (!elSearchEnd.value) elSearchEnd.value = todayCst;
   elOverlay.hidden = false;
-  elSearch.focus();
+  elSearchKeyword.focus();
 }
 
 function closeSearch() {
@@ -309,19 +318,32 @@ function snippetToHtml(snippet) {
 }
 
 async function doSearch() {
-  const q = elSearch.value.trim();
-  if (!q) return;
-  const days = parseInt(elSearchRange.value, 10);
+  if (!state.gid) { elSearchStatus.textContent = "请先选择群"; return; }
+  const sender = elSearchSender.value.trim();
+  const keyword = elSearchKeyword.value.trim();
+  if (!sender && !keyword) {
+    elSearchStatus.textContent = "请至少填写发送者名称或关键词一项";
+    return;
+  }
+  // 起止日期 → CST 当日零点毫秒；end 取次日零点使区间含当天（[start, end)）
+  const startTs = dateStrToCstStartMs(elSearchStart.value);
+  let endTs = dateStrToCstStartMs(elSearchEnd.value);
+  if (endTs != null) endTs += 86400000; // 含结束当天
   elSearchStatus.textContent = "搜索中…";
   elSearchResults.innerHTML = "";
   try {
-    const data = await api(`/api/search?gid=${state.gid}&q=${encodeURIComponent(q)}&days=${days}&limit=200`);
+    const params = new URLSearchParams({ gid: state.gid, limit: 1000 });
+    if (startTs != null) params.set("start_ts", startTs);
+    if (endTs != null) params.set("end_ts", endTs);
+    if (keyword) params.set("q", keyword);
+    if (sender) params.set("sender_name", sender);
+    const data = await api(`/api/search?${params}`);
     const results = data.results || [];
     if (!results.length) {
       elSearchStatus.textContent = "未找到匹配消息";
       return;
     }
-    elSearchStatus.textContent = `共 ${results.length} 条结果` + (results.length >= 200 ? "（已达上限，请缩小范围）" : "");
+    elSearchStatus.textContent = `共 ${results.length} 条结果` + (results.length >= 1000 ? "（已达上限，请缩小范围）" : "");
     elSearchResults.innerHTML = "";
     for (const r of results) {
       const div = document.createElement("div");
@@ -338,8 +360,9 @@ async function doSearch() {
 async function jumpToMessage(mid) {
   closeSearch();
   const myReq = ++state.reqId;
-  elStatus.textContent = "定位中…";
-  const data = await api(`/api/messages/around?gid=${state.gid}&mid=${encodeURIComponent(mid)}&limit=${LIMIT}`);
+  // around 单侧取 floor(LIMIT/2) 条，命中消息位于列表中间，便于看上下文
+  const half = Math.floor(LIMIT / 2);
+  const data = await api(`/api/messages/around?gid=${state.gid}&mid=${encodeURIComponent(mid)}&limit=${half}`);
   if (myReq !== state.reqId) return;
   state.messages = data.messages;
   state.before = data.oldest;
@@ -347,7 +370,7 @@ async function jumpToMessage(mid) {
   state.hasMoreOlder = data.has_more_older;
   state.hasMoreNewer = data.has_more_newer;
   renderMessages(mid);
-  // 滚到命中消息
+  // 滚到命中消息并居中（前后各有内容，可真正居中）
   const target = elMsgList.querySelector(`[data-mid="${CSS.escape(mid)}"]`);
   if (target) target.scrollIntoView({ block: "center" });
   // 左栏同步到命中消息所在日
@@ -355,7 +378,7 @@ async function jumpToMessage(mid) {
     const hit = state.messages.find(m => m.mid === mid) || state.messages[state.messages.length - 1];
     highlightDate(cstDate(hit.created_at));
   }
-  elStatus.textContent = `已定位，共 ${state.messages.length} 条`;
+  elStatus.textContent = "";
 }
 
 // ---------- 双向滚动加载 ----------
@@ -364,8 +387,7 @@ async function loadOlder() {
   state.loadingOlder = true;
   showLoadingMarker("top");
   const myReq = state.reqId;
-  let params = `gid=${state.gid}&before_ts=${state.before.ts}&before_id=${state.before.id}&limit=${LIMIT}`;
-  if (state.selectedSender) params += `&sender_id=${state.selectedSender}`;
+  let params = `gid=${state.gid}&before_ts=${state.before.ts}&limit=${LIMIT}`;
   try {
     const data = await api(`/api/messages?${params}`);
     if (myReq !== state.reqId) return;
@@ -390,17 +412,18 @@ async function loadNewer() {
   state.loadingNewer = true;
   showLoadingMarker("bottom");
   const myReq = state.reqId;
-  let params = `gid=${state.gid}&after_ts=${state.after.ts}&after_id=${state.after.id}&limit=${LIMIT}`;
-  if (state.selectedSender) params += `&sender_id=${state.selectedSender}`;
+  let params = `gid=${state.gid}&after_ts=${state.after.ts}&limit=${LIMIT}`;
   try {
     const data = await api(`/api/messages?${params}`);
     if (myReq !== state.reqId) return;
-    const wasAtBottom = (elMsgList.scrollHeight - elMsgList.scrollTop - elMsgList.clientHeight) < 50;
+    // 记录当前滚动位置；新消息追加到底部，渲染后恢复同样的 scrollTop，
+    // 使当前阅读位置不动，用户可自然向下滚看新内容（不跳到底）。
+    const prevScrollTop = elMsgList.scrollTop;
     state.messages = state.messages.concat(data.messages);
     state.after = data.newest;
     state.hasMoreNewer = data.has_more_newer;
     renderMessages(null);
-    if (wasAtBottom) elMsgList.scrollTop = elMsgList.scrollHeight;
+    elMsgList.scrollTop = prevScrollTop;
   } catch (e) {
     elStatus.textContent = "加载更新失败：" + e.message;
   } finally {
@@ -432,13 +455,16 @@ function showLoadingMarker(pos) {
 }
 
 function setupSentinels() {
+  // rootMargin 提前预加载：用 100%（相对滚动容器可见高度）而非固定像素，
+  // 这样大屏/小屏都能"提前约一屏"触发，避免固定 800px 在大屏上显得太晚。
+  // IntersectionObserver 的 rootMargin 支持百分比，会随容器尺寸自动伸缩。
   const obsTop = new IntersectionObserver((entries) => {
     if (entries[0].isIntersecting) loadOlder();
-  }, { root: elMsgList, rootMargin: "50px" });
+  }, { root: elMsgList, rootMargin: "100% 0px 50px 0px" });
   obsTop.observe(elSentinelTop);
   const obsBottom = new IntersectionObserver((entries) => {
     if (entries[0].isIntersecting) loadNewer();
-  }, { root: elMsgList, rootMargin: "50px" });
+  }, { root: elMsgList, rootMargin: "50px 0px 100% 0px" });
   obsBottom.observe(elSentinelBottom);
 }
 
@@ -455,20 +481,20 @@ async function init() {
 
 // 事件绑定
 elGroup.onchange = () => selectGroup(parseInt(elGroup.value, 10));
-elSender.onchange = () => {
-  const v = elSender.value;
-  state.selectedSender = v ? parseInt(v, 10) : null;
-  if (state.selectedDate) loadByDate(state.gid, state.selectedDate, state.selectedSender);
-};
+
 elDatePicker.onchange = () => {
   if (elDatePicker.value) selectDate(elDatePicker.value);
 };
 
 // 搜索事件绑定
-elSearch.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") { e.preventDefault(); openSearch(); doSearch(); }
+elSearchBtn.onclick = openSearch;
+elSearchSubmit.onclick = doSearch;
+elSearchKeyword.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); doSearch(); }
 });
-elSearchRange.onchange = doSearch;
+elSearchSender.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); doSearch(); }
+});
 elSearchClose.onclick = closeSearch;
 elOverlay.addEventListener("click", (e) => { if (e.target === elOverlay) closeSearch(); });
 document.addEventListener("keydown", (e) => {
