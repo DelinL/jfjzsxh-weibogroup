@@ -68,6 +68,74 @@ def _guess_content_type(path):
     return ct or "application/octet-stream"
 
 
+_MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "media")
+_fid_locks = {}
+_fid_locks_guard = threading.Lock()
+
+
+def _get_fid_lock(fid):
+    with _fid_locks_guard:
+        if fid not in _fid_locks:
+            _fid_locks[fid] = threading.Lock()
+        return _fid_locks[fid]
+
+
+def serve_media(conn, fid):
+    """按需下载并返回媒体文件本地路径。
+
+    返回 (local_path, None) 成功；返回 (None, error_msg) 失败。
+    命中缓存（local_path 存在且文件在）直接返回；否则用 DB cookie 调
+    weibo_im.media.download_file 下载，回写 media_files 与 messages。
+    同一 fid 用进程内锁串行化，避免并发重复下载。
+    """
+    row = conn.execute(
+        "SELECT media_type, orig_url, local_path, mid FROM media_files WHERE fid=?",
+        (fid,)).fetchone()
+    if row is None:
+        return None, "media not found"
+
+    # 命中缓存
+    lp = row["local_path"]
+    if lp and os.path.isfile(lp) and os.path.getsize(lp) > 0:
+        return lp, None
+
+    lock = _get_fid_lock(fid)
+    with lock:
+        # double-check：锁内再查一次，可能已被并发请求下载好
+        row2 = conn.execute(
+            "SELECT local_path FROM media_files WHERE fid=?", (fid,)).fetchone()
+        lp2 = row2["local_path"] if row2 else ""
+        if lp2 and os.path.isfile(lp2) and os.path.getsize(lp2) > 0:
+            return lp2, None
+
+        # 下载
+        from weibo_im.media import download_file
+        cookie = get_cookie(conn)
+        if cookie:
+            from weibo_im.media import set_cookie
+            set_cookie(cookie)
+        result = download_file(fid, row["orig_url"], row["media_type"])
+        if result.get("status") != "done" or not result.get("local_path"):
+            # 回写失败状态
+            conn.execute(
+                "UPDATE media_files SET status='failed' WHERE fid=?", (fid,))
+            conn.commit()
+            return None, "download failed"
+
+        new_path = result["local_path"]
+        conn.execute(
+            "UPDATE media_files SET status='done', local_path=?, "
+            "file_size=?, md5=? WHERE fid=?",
+            (new_path, result.get("file_size", 0),
+             result.get("md5", ""), fid))
+        if row["mid"]:
+            conn.execute(
+                "UPDATE messages SET media_local_path=? WHERE mid=?",
+                (new_path, row["mid"]))
+        conn.commit()
+        return new_path, None
+
+
 # ---------- 查询函数 ----------
 
 def query_groups(conn):
@@ -381,6 +449,30 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_file(self, local_path, cache=True):
+        with open(local_path, "rb") as f:
+            data = f.read()
+        ctype = _guess_content_type(local_path)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        if cache:
+            self.send_header("Cache-Control", "max-age=31536000")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _serve_media_static(self, path):
+        """服务 media/ 下已下载文件，防目录穿越。"""
+        rel = path[len("/media/"):].replace("\\", "/").lstrip("/")
+        full = os.path.normpath(os.path.join(_MEDIA_DIR, rel))
+        if not full.startswith(os.path.normpath(_MEDIA_DIR) + os.sep):
+            self._send_text("Forbidden", status=403)
+            return
+        if not os.path.isfile(full):
+            self._send_text("Not Found", status=404)
+            return
+        self._send_file(full)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -391,6 +483,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path.startswith("/web/"):
             self._serve_static(path[len("/web/"):])
+            return
+        if path.startswith("/media/"):
+            self._serve_media_static(path)
             return
         if path.startswith("/api/"):
             self._route_api(path, qs)
@@ -437,6 +532,13 @@ class Handler(BaseHTTPRequestHandler):
                 limit = int(qs.get("limit", ["1000"])[0])
                 self._send_json(query_search(
                     conn, gid, q, sender_name, start_ts, end_ts, limit))
+            elif path.startswith("/api/media/"):
+                fid = path[len("/api/media/"):]
+                local_path, err = serve_media(conn, fid)
+                if err:
+                    self._send_json({"error": err}, status=404)
+                else:
+                    self._send_file(local_path)
             else:
                 self._send_json({"error": "not found"}, status=404)
         except Exception as e:

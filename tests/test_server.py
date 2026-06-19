@@ -5,8 +5,9 @@ import socket
 import sqlite3
 import threading
 import unittest
+from unittest import mock
 
-from tests.conftest import make_test_db, insert_messages
+from tests.conftest import make_test_db, insert_messages, insert_media_files, set_config
 import server
 
 
@@ -338,6 +339,29 @@ class SearchApiTest(_ServerTestBase):
         status, data = self._get_json(path)
         self.assertEqual(status, 200)
         self.assertEqual(data["results"], [])
+
+
+class MediaApiTest(_ServerTestBase):
+    def make_data(self, conn):
+        set_config(conn, "weibo_cookie", "FAKE_COOKIE=1")
+
+    def _get(self, path):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        self._last_content_type = resp.getheader("Content-Type")
+        conn.close()
+        return resp.status, body
+
+    def _get_json(self, path):
+        status, body = self._get(path)
+        return status, json.loads(body.decode("utf-8"))
+
+    def test_media_not_found(self):
+        status, body = self._get_json("/api/media/nonexistent_fid")
+        self.assertEqual(status, 404)
+        self.assertIn("not found", body["error"])
 
 
 if __name__ == "__main__":
