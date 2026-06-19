@@ -413,6 +413,45 @@ class MediaApiTest(_ServerTestBase):
         self.assertEqual(r["local_path"], new_path)
         conn.close()
 
+    def test_media_download_fails(self):
+        conn = sqlite3.connect(self.db_path)
+        insert_media_files(conn, [{
+            "fid": "img_fail", "gid": 1, "mid": "m3", "media_type": 1,
+            "orig_url": "http://example.com/fail", "local_path": "",
+            "status": "pending", "created_at": 0,
+        }])
+        conn.close()
+
+        with mock.patch("weibo_im.media.download_file",
+                        return_value={"status": "failed", "local_path": "",
+                                      "file_size": 0, "md5": ""}):
+            status, body = self._get_json("/api/media/img_fail")
+        self.assertEqual(status, 404)
+        self.assertIn("download failed", body["error"])
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        r = conn.execute("SELECT status FROM media_files WHERE fid='img_fail'").fetchone()
+        self.assertEqual(r["status"], "failed")
+        conn.close()
+
+    def test_media_static_path_traversal(self):
+        status, body = self._get("/media/../../../etc/passwd")
+        self.assertIn(status, (403, 404))
+
+    def test_media_static_serves_file(self):
+        import os
+        img_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "media", "images")
+        os.makedirs(img_dir, exist_ok=True)
+        fpath = os.path.join(img_dir, "_test_static.jpg")
+        with open(fpath, "wb") as f:
+            f.write(b"\xff\xd8STATIC")
+        self.addCleanup(os.remove, fpath)
+
+        status, body = self._get("/media/images/_test_static.jpg")
+        self.assertEqual(status, 200)
+        self.assertIn("image", self._last_content_type)
+
 
 if __name__ == "__main__":
     unittest.main()
