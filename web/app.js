@@ -406,20 +406,46 @@ async function loadOlder() {
   try {
     const data = await api(`/api/messages?${params}`);
     if (myReq !== state.reqId) return;
-    // 保持滚动位置：记录旧 scrollHeight，插入后补偿
-    const prevHeight = elMsgList.scrollHeight;
+    // 锚点定位法保持滚动位置：渲染前记录视口顶部附近的消息元素相对容器的偏移，
+    // 渲染后定位到同一元素，使视口内容不跳动。比高度差补偿更稳健，不受
+    // loading 标记等任何高度变化干扰。用 getBoundingClientRect 不依赖 offsetParent。
+    const anchor = firstVisibleMsg();
+    const oldRect = anchor
+      ? anchor.el.getBoundingClientRect().top - elMsgList.getBoundingClientRect().top
+      : 0;
     state.messages = data.messages.concat(state.messages);
     state.before = data.oldest;
     state.hasMoreOlder = data.has_more_older;
-    // 重新渲染（简单可靠，500 条开销可接受）
     renderMessages(null);
-    elMsgList.scrollTop = elMsgList.scrollHeight - prevHeight;
+    if (anchor) {
+      const same = elMsgList.querySelector(`[data-mid="${CSS.escape(anchor.mid)}"]`);
+      if (same) {
+        const newRect = same.getBoundingClientRect().top - elMsgList.getBoundingClientRect().top;
+        elMsgList.scrollTop += newRect - oldRect;
+      }
+    }
   } catch (e) {
     elStatus.textContent = "加载更早失败：" + e.message;
   } finally {
     state.loadingOlder = false;
     showLoadingMarker(null);
   }
+}
+
+// 找到当前视口顶部第一个可见的消息元素（含系统消息），返回 {el, mid}。
+// 用于上滑加载前锚定阅读位置，渲染后恢复。用 getBoundingClientRect 判定可见性。
+function firstVisibleMsg() {
+  const containerTop = elMsgList.getBoundingClientRect().top;
+  let best = null;
+  for (const el of elMsgList.querySelectorAll("[data-mid]")) {
+    // 元素底部超过容器顶部即视为进入视口；记录首个及它之前最后一个
+    if (el.getBoundingClientRect().bottom > containerTop) {
+      best = el;
+      break;
+    }
+    best = el;
+  }
+  return best ? { el: best, mid: best.dataset.mid } : null;
 }
 
 async function loadNewer() {
