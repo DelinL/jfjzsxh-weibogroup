@@ -105,7 +105,7 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 .search-fields {
   display: flex; gap: 8px; padding: 10px 14px; border-bottom: 1px solid #eee;
 }
-.search-fields input { padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+.search-fields input { padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; -webkit-appearance: none; appearance: none; }
 .search-fields #search-sender { flex: 0 1 240px; }
 .search-fields #search-keyword { flex: 2 1 240px; }
 .search-fields .field-label { display: flex; align-items: center; gap: 6px;
