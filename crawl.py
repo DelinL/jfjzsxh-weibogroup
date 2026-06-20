@@ -101,6 +101,21 @@ def _check_playwright(log: logging.Logger) -> bool:
     return ok
 
 
+def _is_logged_in(page) -> bool:
+    """判断 api.weibo.com/chat 当前是否处于登录态。
+
+    判据：未登录时 URL 为 ``https://api.weibo.com/chat#/``，
+    扫码登录成功后 hash 路由跳转为 ``.../#/chat``。
+    用 URL hash 变化作为唯一可靠判据（page.url 检测不到 hash 路由，必须用
+    JS 读 location.href）；evaluate 抛异常（页面已关闭等）安全降级为未登录。
+    """
+    try:
+        href = page.evaluate("window.location.href") or ""
+    except Exception:
+        return False
+    return "#/chat" in href
+
+
 def _renew_cookie(db_path: str, log: logging.Logger, headless: bool):
     """用 Playwright 打开 api.weibo.com/chat → 截图二维码 → 等你扫码 → 存 cookie
 
@@ -136,11 +151,10 @@ def _renew_cookie(db_path: str, log: logging.Logger, headless: bool):
             page.goto("https://api.weibo.com/chat", wait_until="domcontentloaded", timeout=30000)
             time.sleep(3)
 
-            # 判断是否已登录（用 JS 读 location.href，page.url 检测不到 hash 路由）
             current_href = page.evaluate("window.location.href")
             log.info("当前 URL: %s", current_href)
 
-            if "#/chat" in current_href:
+            if _is_logged_in(page):
                 log.info("已有有效 cookie，直接提取")
             else:
                 # 截图发微信（原版）→ 改为本地截图 + 尝试打开
@@ -159,9 +173,8 @@ def _renew_cookie(db_path: str, log: logging.Logger, headless: bool):
                 for i in range(120):
                     time.sleep(1)
                     try:
-                        current = page.evaluate("window.location.href")
-                        if current != current_href:
-                            log.info("检测到页面跳转: %s → %s", current_href, current)
+                        if _is_logged_in(page):
+                            log.info("检测到页面跳转: %s → %s", current_href, page.evaluate("window.location.href"))
                             log.info("🔍 检测到扫码登录，正在处理...")
                             try:
                                 page.wait_for_load_state("networkidle", timeout=15000)
