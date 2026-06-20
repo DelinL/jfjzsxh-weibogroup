@@ -165,6 +165,8 @@ ehthumbs_vista.db
 Desktop.ini
 $RECYCLE.BIN/
 *.lnk
+# ZCode 等 agent 误生成的垃圾文件（Windows 保留设备名重定向产物）
+nul
 
 # macOS
 .DS_Store
