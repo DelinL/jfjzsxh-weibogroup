@@ -190,3 +190,4 @@ Icon
 
 *.orig
 *.rej
+.worktrees/
