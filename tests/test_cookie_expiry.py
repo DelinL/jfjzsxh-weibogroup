@@ -26,6 +26,17 @@ def test_contacts_raises_for_explicit_cookie_error_21301():
             crawler_module.fetch_contacts(session)
 
 
+def test_contacts_raises_for_explicit_login_redirect():
+    session = MagicMock()
+    resp = _response(
+        {},
+        url="https://login.sina.com.cn/sso/login.php",
+    )
+    with patch.object(crawler_module, "_request_with_retry", return_value=resp):
+        with pytest.raises(crawler_module.CookieExpiredError):
+            crawler_module.fetch_contacts(session)
+
+
 @pytest.mark.parametrize("data", [
     {"contacts": []},
     {"error_code": 10012, "error": "服务异常"},
