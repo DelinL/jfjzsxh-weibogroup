@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import random
 import logging
@@ -130,11 +131,122 @@ def _request_with_retry(session: requests.Session, method: str, url: str,
 
 
 def make_session(cookie: str) -> requests.Session:
+    """用 cookie 字符串构造 session。
+
+    cookie 写进 session.cookies（jar）而非 headers['Cookie']：微博 SSO 续期
+    链会在响应里 Set-Cookie 下发刷新后的 SUB/SUBP，jar 方式才能自动接收并
+    在后续请求中携带；headers 方式会覆盖 jar 导致续期 cookie 被丢弃。
+    不绑定 domain，使 login.sina.com.cn 等 SSO 域请求也能带上 cookie。
+    """
     session = requests.Session()
     session.verify = False
     session.headers.update(HEADERS)
-    session.headers["Cookie"] = cookie
+    for part in cookie.split("; "):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            session.cookies.set(k, v)
     return session
+
+
+def _serialize_cookies(session: requests.Session) -> str:
+    """把 session.cookies 序列化回 'k=v; k=v' 字符串（与 DB 存储格式一致）。"""
+    return "; ".join(f"{c.name}={c.value}" for c in session.cookies)
+
+
+def renew_cookie(session: requests.Session) -> bool:
+    """主动触发微博 SSO 续期链（复刻 ssologin.js 的 updateCookie 逻辑）。
+
+    在 cookie 仍有效时调用：updatetgt.php 探针 → crossdomain.php 拿跨域
+    ticket URL 列表 → 逐个请求让各域 Set-Cookie 刷新后的 SUB/SUBP。服务端
+    自动判断是否需要换 SUB（cookie 太新则不换，retcode 仍为 0）。
+
+    续期链用独立的临时 session 跑，避免各域 Set-Cookie（如 passport.weibo.cn
+    会下发 .weibo.cn 域的 SSOLoginState）污染主 session 的 cookie jar。
+    只把刷新后的 SUB/SUBP/SSOLoginState/ALF 等关键字段合并回主 session。
+
+    返回 True 表示续期链走通且 cookie 有效；False 表示已失效或网络异常，
+    需扫码续期。任何异常都降级为 False，不阻断爬取——后续请求会自然触发
+    CookieExpiredError，由顶层提示用户扫码。
+    """
+    sso_base = "https://login.sina.com.cn/sso"
+    # 用独立 session 跑续期链，避免跨域 Set-Cookie 污染主 session
+    tmp = make_session(_serialize_cookies(session))
+    try:
+        # 1. updatetgt.php 探针
+        tmp.get(f"{sso_base}/updatetgt.php",
+                params={"entry": "account", "callback": "cb"},
+                timeout=15)
+        # 2. crossdomain.php 拿各域 ticket URL
+        r = tmp.get(f"{sso_base}/crossdomain.php",
+                    params={"action": "login", "domain": "sina.com.cn",
+                            "callback": "cb", "sr": "1920*1080"},
+                    timeout=15)
+        m = re.search(r'"arrURL":\[([^\]]*)\]', r.text)
+        if not m:
+            log.warning("cookie 续期：crossdomain 未返回 arrURL")
+            return False
+        urls = json.loads("[" + m.group(1) + "]")
+        # 3. 逐个请求，让各域 Set-Cookie 刷新登录态
+        for u in urls:
+            tmp.get(u, params={"callback": "cb"}, timeout=15)
+    except Exception as e:
+        log.warning("cookie 续期失败（可能已过期）: %s", e)
+        return False
+    # 把刷新后的关键字段合并回主 session（只取 .weibo.com 域登录态相关 cookie）
+    renewed = False
+    for name in ("SUB", "SUBP", "SSOLoginState", "ALF"):
+        # 续期链可能为同名 cookie 设置多个域（.weibo.com / .weibo.cn），
+        # 取 weibo.com 域的；若没有则取任意一个
+        candidates = [c for c in tmp.cookies if c.name == name
+                      and (c.domain is None or "weibo.com" in (c.domain or ""))]
+        if not candidates:
+            candidates = [c for c in tmp.cookies if c.name == name]
+        if not candidates:
+            continue
+        new_val = candidates[0].value
+        old_val = session.cookies.get(name)
+        if new_val and new_val != old_val:
+            session.cookies.set(name, new_val)
+            renewed = True
+    if renewed:
+        log.info("cookie 续期成功，已更新关键字段")
+    else:
+        log.info("cookie 续期链完成（服务端判断无需换 SUB，cookie 仍有效）")
+    return True
+
+
+# 距登录多久后开始主动续期（秒）。SUB 实测寿命约 6 天，留 1 天余量。
+_RENEW_THRESHOLD_SEC = 5 * 86400
+
+
+def _maybe_renew_cookie(cookie: str, session: requests.Session,
+                        db_set_cookie) -> str | None:
+    """距上次登录超过阈值才触发续期，避免每次爬取都调续期链。
+
+    每次调用续期链都可能让微博服务端刷新会话状态，频繁调用反而可能加速
+    SUB 失效。SSOLoginState 是扫码登录时刻的 Unix 秒，据此判断是否到续期窗口。
+    续期后若有字段更新，写回 DB 并返回新 cookie；否则返回 None。
+    """
+    sso = ""
+    for part in cookie.split("; "):
+        if part.startswith("SSOLoginState="):
+            sso = part.split("=", 1)[1]
+            break
+    if sso:
+        try:
+            login_ts = int(sso)
+        except ValueError:
+            login_ts = 0
+        age = time.time() - login_ts
+        if age < _RENEW_THRESHOLD_SEC:
+            return None  # 还没到续期窗口，跳过
+    if not renew_cookie(session):
+        return None
+    new_cookie = _serialize_cookies(session)
+    if new_cookie != cookie:
+        db_set_cookie(new_cookie)
+        return new_cookie
+    return None
 
 
 # ── API 调用 ──────────────────────────────────────────────
@@ -244,6 +356,12 @@ class Crawler:
                 "'SUB=xxx; SUBP=yyy'"
             )
         self.session = make_session(self.cookie)
+        # 主动续期 cookie（仅当距上次登录超过 5 天时触发，避免每次爬取都
+        # 调续期链导致服务端失效旧 SUB）。SSOLoginState 是登录时刻的 Unix 秒。
+        new_cookie = _maybe_renew_cookie(self.cookie, self.session, db_set_cookie)
+        if new_cookie:
+            self.cookie = new_cookie
+            self.session = make_session(self.cookie)
 
     def sync_groups(self) -> list[dict]:
         """刷新群列表，返回群列表（过滤掉 config skip_gids）"""

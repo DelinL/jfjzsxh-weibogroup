@@ -138,3 +138,18 @@ def test_script_entrypoint_does_not_report_renew_for_unrelated_error(
 
 def test_module_keeps_main_as_the_only_entrypoint():
     assert not hasattr(crawl, "cli")
+
+
+def test_renew_cookie_rejects_missing_sub_via_inspection():
+    """_renew_cookie 在 set_cookie 前应有 SUB 兜底校验（对齐 weiboblog）。
+
+    通过源码检查验证：扫码后若未提取到 SUB，应报错退出而非把残缺 cookie 写库。
+    """
+    source = (Path(__file__).parents[1] / "crawl.py").read_text(encoding="utf-8")
+    # SUB 校验应在 set_cookie 之前
+    sub_check = 'if "SUB" not in deduped'
+    set_cookie_call = "set_cookie(cookie_str)"
+    assert sub_check in source, "crawl.py 应有 SUB 兜底校验"
+    assert set_cookie_call in source, "crawl.py 应调用 set_cookie"
+    assert source.index(sub_check) < source.index(set_cookie_call), \
+        "SUB 校验应在 set_cookie 之前"

@@ -203,6 +203,10 @@ def _renew_cookie(db_path: str, log: logging.Logger, headless: bool):
         finally:
             browser.close()
 
+    if "SUB" not in deduped:
+        log.error("未提取到 SUB cookie，登录可能未成功，请重新扫码")
+        sys.exit(1)
+
     # 存入数据库
     from weibo_im.db import set_db_path, init_db, set_cookie
     set_db_path(db_path)
