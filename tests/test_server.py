@@ -453,5 +453,101 @@ class MediaApiTest(_ServerTestBase):
         self.assertIn("image", self._last_content_type)
 
 
+class SyncApiTest(_ServerTestBase):
+    """同步接口：单飞（409）、状态轮询、成功/失败状态结构。"""
+
+    def _post(self, path):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", path)
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8")
+        conn.close()
+        return resp.status, json.loads(body) if body else {}
+
+    def test_status_idle_when_no_sync(self):
+        status, body = self._get_json("/api/sync/status")
+        self.assertEqual(status, 200)
+        self.assertFalse(body["running"])
+        self.assertIsNone(body["exit_code"])
+        self.assertEqual(body["output"], "")
+
+    def test_sync_start_then_409_when_already_running(self):
+        # 用假 proc 占位模拟"同步进行中"
+        server._sync_state["proc"] = object()  # truthy 占位
+        server._sync_state["exit_code"] = None
+        try:
+            status, body = self._post("/api/sync")
+            self.assertEqual(status, 409)
+            self.assertIn("already running", body["error"])
+            # 状态反映 running=True
+            _, st = self._get_json("/api/sync/status")
+            self.assertTrue(st["running"])
+        finally:
+            server._sync_state["proc"] = None
+            server._sync_state["exit_code"] = None
+
+    def test_status_reports_exit_code_and_output(self):
+        server._sync_state["proc"] = None
+        server._sync_state["exit_code"] = 0
+        server._sync_state["output"] = ["爬取完成: 1 个群", "+5 条"]
+        try:
+            status, body = self._get_json("/api/sync/status")
+            self.assertEqual(status, 200)
+            self.assertFalse(body["running"])
+            self.assertEqual(body["exit_code"], 0)
+            self.assertIn("爬取完成", body["output"])
+        finally:
+            server._sync_state["output"] = []
+            server._sync_state["exit_code"] = None
+
+    @mock.patch("server._start_sync")
+    def test_sync_start_returns_202(self, mock_start):
+        mock_start.return_value = True
+        status, body = self._post("/api/sync")
+        self.assertEqual(status, 202)
+        self.assertEqual(body["status"], "started")
+
+    @mock.patch("server._start_sync")
+    def test_sync_start_returns_409_when_busy(self, mock_start):
+        mock_start.return_value = False
+        status, body = self._post("/api/sync")
+        self.assertEqual(status, 409)
+        self.assertIn("already running", body["error"])
+
+    @mock.patch("server.subprocess.Popen")
+    def test_start_sync_spawns_crawl_and_single_flight(self, mock_popen):
+        import time
+
+        # stdout 阻塞式迭代器：让 worker 线程在读取循环中挂住，
+        # 保持 _sync_state["proc"] 非空，从而验证第二次调用被单飞拦截
+        class _BlockingStdout:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                time.sleep(100)
+
+        mock_proc = mock.MagicMock()
+        mock_proc.stdout = _BlockingStdout()
+        mock_proc.wait.return_value = 0
+        mock_popen.return_value = mock_proc
+        # 清空全局状态
+        server._sync_state["proc"] = None
+        server._sync_state["exit_code"] = None
+        server._sync_state["output"] = []
+        try:
+            self.assertTrue(server._start_sync())
+            # 第二次调用应被单飞拦截
+            self.assertFalse(server._start_sync())
+            # proc 仍非空（worker 在阻塞中）
+            self.assertIsNotNone(server._sync_state["proc"])
+            mock_popen.assert_called_once()
+        finally:
+            # 直接清掉占位，放弃 worker 线程（daemon，随进程退出）
+            server._sync_state["proc"] = None
+            server._sync_state["exit_code"] = None
+            server._sync_state["output"] = []
+
+
 if __name__ == "__main__":
     unittest.main()

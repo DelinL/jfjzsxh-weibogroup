@@ -629,8 +629,12 @@ document.addEventListener("keydown", (e) => {
 
 // ---------- 同步 ----------
 let syncPollTimer = null;
+// 同步进行中标志：避免手动 + 自动并发触发
+let syncInProgress = false;
 
-elSyncBtn.addEventListener("click", async () => {
+async function runSync() {
+  if (syncInProgress) return;
+  syncInProgress = true;
   elSyncBtn.disabled = true;
   elSyncBtn.textContent = "同步中...";
   try {
@@ -640,6 +644,7 @@ elSyncBtn.addEventListener("click", async () => {
       throw new Error("同步启动失败");
     }
   } catch (e) {
+    syncInProgress = false;
     elSyncBtn.disabled = false;
     elSyncBtn.textContent = "🔄 同步";
     elStatus.textContent = "同步启动失败";
@@ -647,7 +652,9 @@ elSyncBtn.addEventListener("click", async () => {
   }
   syncPollTimer = setInterval(pollSync, 2000);
   pollSync();
-});
+}
+
+elSyncBtn.addEventListener("click", () => runSync());
 
 async function pollSync() {
   try {
@@ -655,11 +662,12 @@ async function pollSync() {
     if (!data.running) {
       clearInterval(syncPollTimer);
       syncPollTimer = null;
+      syncInProgress = false;
+      elSyncBtn.disabled = false;
+      elSyncBtn.textContent = "🔄 同步";
       if (data.exit_code === 0) {
-        location.reload();
+        await silentRefresh();  // 静默局部更新，不再 location.reload()
       } else {
-        elSyncBtn.disabled = false;
-        elSyncBtn.textContent = "🔄 同步";
         elStatus.textContent = "同步失败（exit " + data.exit_code + "），请查看日志";
       }
     }
@@ -668,4 +676,143 @@ async function pollSync() {
   }
 }
 
+// 静默刷新：同步成功后局部更新当前视图，不打断阅读。
+// 刷新群下拉计数 + 日期列表计数（保留展开态）+ 追加新消息到底部（不滚动）。
+async function silentRefresh() {
+  // 搜索面板打开时只更新群计数，不打断搜索
+  const searchOpen = !elOverlay.hidden;
+
+  // 1) 群下拉：更新计数，保留当前选中
+  try {
+    const groups = await api("/api/groups");
+    const cur = elGroup.value;
+    state.groups = groups;
+    elGroup.innerHTML = groups.map(g =>
+      `<option value="${g.gid}">${escapeHtml(g.name)} (${g.msg_count})</option>`).join("");
+    if (cur) elGroup.value = cur;
+  } catch (e) { /* 忽略，继续 */ }
+
+  if (!state.gid) return;
+
+  // 2) 日期列表：局部更新月计数（保留展开态），展开的月份重取每日计数
+  try {
+    const monthsData = await api(`/api/dates?gid=${state.gid}`);
+    const byMonth = new Map(monthsData.map(m => [m.month, m.count]));
+    // 更新已存在月份的计数，收集需重取每日的展开月份
+    const toReloadDays = [];
+    for (const mg of state.dates) {
+      if (byMonth.has(mg.month)) {
+        mg.count = byMonth.get(mg.month);
+        byMonth.delete(mg.month);
+        if (mg.open && mg.days) toReloadDays.push(mg);
+      }
+    }
+    // 新增月份（同步后可能出现新月份），插入到对应位置（倒序）
+    for (const [month, count] of byMonth) {
+      const mg = { month, count, days: null, open: false };
+      let idx = state.dates.findIndex(d => d.month < month);
+      if (idx === -1) state.dates.push(mg);
+      else state.dates.splice(idx, 0, mg);
+    }
+    // 重取已展开月份的每日列表（计数可能已变）
+    await Promise.all(toReloadDays.map(async mg => {
+      try {
+        mg.days = await api(`/api/dates?gid=${state.gid}&month=${encodeURIComponent(mg.month)}`);
+      } catch (e) { /* 保留旧数据 */ }
+    }));
+    renderDateList();
+  } catch (e) { /* 忽略 */ }
+
+  // 3) 消息：搜索打开时不追加；否则若处于最新位置则静默拉取新消息
+  if (searchOpen || !state.selectedDate) return;
+  // hasMoreNewer 为 true 说明用户在看较早的数据，前面还有未翻页的新消息，
+  // 同步新增的消息在更后面，不打断当前阅读，仅更新了日期列表计数
+  if (state.hasMoreNewer) return;
+  if (state.loadingNewer || !state.after) return;
+  const myReq = state.reqId;
+  try {
+    const data = await api(`/api/messages?gid=${state.gid}&after_ts=${state.after.ts}&limit=${LIMIT}`);
+    if (myReq !== state.reqId) return;  // 用户已切走，丢弃
+    if (!data.messages.length) {
+      state.hasMoreNewer = false;
+      return;
+    }
+    // 追加到底部，保持当前滚动位置（用户可自然下滑查看新内容）
+    const prevScrollTop = elMsgList.scrollTop;
+    state.messages = state.messages.concat(data.messages);
+    state.after = data.newest;
+    state.hasMoreNewer = data.has_more_newer;
+    renderMessages(null);
+    elMsgList.scrollTop = prevScrollTop;
+  } catch (e) { /* 静默失败 */ }
+}
+
+// ---------- 自动同步（每 60 秒，默认开启）----------
+const autoRefreshCheck = $("auto-refresh-check");
+const autoRefreshCountdown = $("auto-refresh-countdown");
+let autoRefreshTimer = null;
+let autoRefreshSeconds = 0;  // 距下次同步剩余秒数
+const AUTO_REFRESH_INTERVAL = 60;
+
+function updateCountdownDisplay() {
+  if (autoRefreshCheck.checked) {
+    // 实心圆顺时针排空：透明区从顶部 0° 顺时针扫过吃掉绿色
+    // 60s 全绿，时间流逝透明弧顺时针增长至 0s 全空
+    const elapsed = AUTO_REFRESH_INTERVAL - autoRefreshSeconds;
+    const boundary = 360 * (elapsed / AUTO_REFRESH_INTERVAL);
+    autoRefreshCountdown.style.background =
+      `conic-gradient(from 0deg, transparent 0deg ${boundary}deg, #4caf50 ${boundary}deg 360deg)`;
+    autoRefreshCountdown.title = `距下次同步 ${autoRefreshSeconds}s`;
+    autoRefreshCountdown.hidden = false;
+  } else {
+    autoRefreshCountdown.hidden = true;
+  }
+}
+
+function startAutoRefresh() {
+  if (autoRefreshTimer) return;
+  autoRefreshSeconds = AUTO_REFRESH_INTERVAL;
+  updateCountdownDisplay();
+  autoRefreshTimer = setInterval(autoRefreshTick, 1000);
+}
+
+function stopAutoRefresh() {
+  if (autoRefreshTimer) {
+    clearInterval(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+  updateCountdownDisplay();
+}
+
+async function autoRefreshTick() {
+  autoRefreshSeconds--;
+  if (autoRefreshSeconds <= 0) {
+    // 倒计时归零：触发同步，重置计时
+    autoRefreshSeconds = AUTO_REFRESH_INTERVAL;
+    updateCountdownDisplay();
+    // 已有同步在跑则跳过，避免并发
+    try {
+      const st = await (await fetch("/api/sync/status")).json();
+      if (st.running) return;
+    } catch (e) {
+      return;  // 状态查询失败，跳过本次
+    }
+    runSync();
+  } else {
+    updateCountdownDisplay();
+  }
+}
+
+autoRefreshCheck.addEventListener("change", () => {
+  if (autoRefreshCheck.checked) {
+    // 开启：立即同步一次，然后启动定时器
+    runSync();
+    startAutoRefresh();
+  } else {
+    stopAutoRefresh();
+  }
+});
+
 init();
+// 默认开启自动同步
+startAutoRefresh();
