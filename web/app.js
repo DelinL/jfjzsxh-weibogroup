@@ -14,6 +14,7 @@ const state = {
   loadingOlder: false,
   loadingNewer: false,
   reqId: 0,
+  memberName: "",       // 成员过滤：空 = 全部
 };
 
 const LIMIT = 100;
@@ -21,6 +22,7 @@ const LIMIT = 100;
 // ---------- DOM ----------
 const $ = (id) => document.getElementById(id);
 const elGroup = $("group-select");
+const elMember = $("member-select");
 const elSearchBtn = $("search-btn");
 const elSyncBtn = $("sync-btn");
 const elStatus = $("status");
@@ -42,6 +44,23 @@ async function api(path) {
   const resp = await fetch(path);
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   return resp.json();
+}
+
+// 返回成员过滤的 query string 片段（含前导 &），无过滤时返回 ""
+function memberFilterQ() {
+  return state.memberName ? `&sender_name=${encodeURIComponent(state.memberName)}` : "";
+}
+
+async function loadMembers(gid) {
+  try {
+    const members = await api(`/api/members?gid=${gid}`);
+    elMember.innerHTML = '<option value="">全部成员</option>'
+      + members.map(m => `<option value="${escapeHtml(m.sender_name)}">${escapeHtml(m.sender_name)} (${m.msg_count})</option>`).join("");
+    // 保持当前选中（若仍在该群）
+    if (state.memberName) elMember.value = state.memberName;
+  } catch (e) {
+    elMember.innerHTML = '<option value="">全部成员</option>';
+  }
 }
 
 // ---------- 工具 ----------
@@ -266,7 +285,7 @@ async function loadMonthDays(month) {
 async function loadByDate(gid, date) {
   const myReq = ++state.reqId;
   elStatus.textContent = "加载中…";
-  let params = `gid=${gid}&date=${encodeURIComponent(date)}&limit=${LIMIT}`;
+  let params = `gid=${gid}&date=${encodeURIComponent(date)}&limit=${LIMIT}${memberFilterQ()}`;
   const data = await api(`/api/messages/by_date?${params}`);
   if (myReq !== state.reqId) return; // 已被新请求覆盖
   state.messages = data.messages;
@@ -290,6 +309,7 @@ async function selectGroup(gid) {
   state.gid = gid;
   elStatus.textContent = "加载中…";
   await loadDates(gid);
+  loadMembers(gid);  // 异步加载，不阻塞
   // 默认展开最近月 + 加载每日 + 选最新日期
   if (state.dates.length) {
     const latest = state.dates[0];
@@ -342,8 +362,10 @@ function snippetToHtml(snippet) {
 
 async function doSearch() {
   if (!state.gid) { elSearchStatus.textContent = "请先选择群"; return; }
-  const sender = elSearchSender.value.trim();
+  let sender = elSearchSender.value.trim();
   const keyword = elSearchKeyword.value.trim();
+  // 若成员过滤器已选中但搜索面板发送者为空，自动带入
+  if (!sender && state.memberName) sender = state.memberName;
   if (!sender && !keyword) {
     elSearchStatus.textContent = "请至少填写发送者名称或关键词一项";
     return;
@@ -410,7 +432,7 @@ async function loadOlder() {
   state.loadingOlder = true;
   showLoadingMarker("top");
   const myReq = state.reqId;
-  let params = `gid=${state.gid}&before_ts=${state.before.ts}&limit=${LIMIT}`;
+  let params = `gid=${state.gid}&before_ts=${state.before.ts}&limit=${LIMIT}${memberFilterQ()}`;
   try {
     const data = await api(`/api/messages?${params}`);
     if (myReq !== state.reqId) return;
@@ -461,7 +483,7 @@ async function loadNewer() {
   state.loadingNewer = true;
   showLoadingMarker("bottom");
   const myReq = state.reqId;
-  let params = `gid=${state.gid}&after_ts=${state.after.ts}&limit=${LIMIT}`;
+  let params = `gid=${state.gid}&after_ts=${state.after.ts}&limit=${LIMIT}${memberFilterQ()}`;
   try {
     const data = await api(`/api/messages?${params}`);
     if (myReq !== state.reqId) return;
@@ -608,6 +630,11 @@ document.addEventListener("keydown", (e) => {
 
 elGroup.onchange = () => selectGroup(parseInt(elGroup.value, 10));
 
+elMember.onchange = () => {
+  state.memberName = elMember.value;
+  if (state.selectedDate) loadByDate(state.gid, state.selectedDate);
+};
+
 elDatePicker.onchange = () => {
   if (elDatePicker.value) selectDate(elDatePicker.value);
 };
@@ -731,7 +758,7 @@ async function silentRefresh() {
   if (state.loadingNewer || !state.after) return;
   const myReq = state.reqId;
   try {
-    const data = await api(`/api/messages?gid=${state.gid}&after_ts=${state.after.ts}&limit=${LIMIT}`);
+    const data = await api(`/api/messages?gid=${state.gid}&after_ts=${state.after.ts}&limit=${LIMIT}${memberFilterQ()}`);
     if (myReq !== state.reqId) return;  // 用户已切走，丢弃
     if (!data.messages.length) {
       state.hasMoreNewer = false;

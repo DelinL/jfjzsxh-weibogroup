@@ -149,6 +149,20 @@ def _serve_media_impl(conn, fid):
         return new_path, None
 
 
+def query_members_list(conn, gid):
+    """返回群内发言过的成员列表（sender_id + sender_name），按最近发言倒序。"""
+    rows = conn.execute(
+        "SELECT sender_id, sender_name, MAX(created_at) AS last_msg_at, "
+        "COUNT(*) AS msg_count FROM messages "
+        "WHERE gid=? AND msg_type IN (100, 321) "
+        "GROUP BY sender_id ORDER BY last_msg_at DESC",
+        (gid,),
+    ).fetchall()
+    return [{"sender_id": r["sender_id"],
+             "sender_name": r["sender_name"],
+             "msg_count": r["msg_count"]} for r in rows]
+
+
 # ---------- 查询函数 ----------
 
 def query_groups(conn):
@@ -595,6 +609,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(query_month_days(conn, gid, month))
                 else:
                     self._send_json(query_dates(conn, gid))
+            elif path == "/api/members":
+                gid = int(qs.get("gid", ["0"])[0])
+                self._send_json(query_members_list(conn, gid))
             elif path == "/api/messages":
                 gid = int(qs.get("gid", ["0"])[0])
                 sender_name = qs.get("sender_name", [""])[0] or ""
