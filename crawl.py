@@ -264,6 +264,57 @@ def _do_search(db_path: str, keyword: str, limit: int):
     _print_search_results(rows, keyword, limit)
 
 
+def _do_list_members(db_path: str, gid: int, log: logging.Logger):
+    """列出指定群内发过言的成员（sender_id / 昵称 / 发言数 / 最近发言时间）。"""
+    if not gid:
+        log.error("--list-members 需要配合 --gid 指定群")
+        return
+    from weibo_im.export import list_members
+    members = list_members(db_path, gid)
+    if members:
+        from weibo_im.export import ms_to_cst
+        for m in members:
+            ts = m.get("last_msg_at") or 0
+            last = ms_to_cst(ts) or "(无)"
+            log.info("  sender_id=%-12d 发言=%-5d 最近=%s  %s",
+                     m["sender_id"], m["msg_count"], last, m["sender_name"] or "(未知)")
+
+
+def _do_export(db_path: str, gid: int, sender_name: str, sender_id: int,
+               since: str, until: str, output: str, log: logging.Logger):
+    """导出指定群内某成员本人发言为 JSON 文件（用于 AI 分析）。
+
+    参数校验后委托 weibo_im.export 模块完成 DB 查询、JSON 组装、文件写入。
+    """
+    if not gid:
+        log.error("--export 需要配合 --gid 指定群")
+        return
+    if not sender_name and not sender_id:
+        log.error("--export 需要指定成员：--sender-name 或 --sender-id 至少给一个")
+        log.error("提示：用 --list-members --gid GID 查看群内成员昵称/ID")
+        return
+
+    from weibo_im.export import export_member_messages
+    since_ms = _parse_since(since) if since else None
+    until_ms = _parse_since(until) if until else None
+
+    result = export_member_messages(
+        db_path=db_path, gid=gid,
+        sender_name=sender_name or None,
+        sender_id=sender_id or None,
+        since_ms=since_ms, until_ms=until_ms,
+        output_path=output or None,
+    )
+
+    count = result["count"]
+    output_path = result["path"]
+    log.info("已导出 %d 条发言 → %s", count, output_path)
+    if count:
+        log.info("时间范围: %s ~ %s (CST)", result["start_cst"], result["end_cst"])
+    else:
+        log.warning("未找到匹配的发言，请用 --list-members 核对成员标识与 --gid")
+
+
 def main():
     parser = argparse.ArgumentParser(description="微博群聊消息抓取（本地版）")
     parser.add_argument("--db", default="", help="数据库路径（默认 <项目>/weibo_im.db）")
@@ -297,6 +348,18 @@ def main():
                         help="全文搜索消息（FTS5 关键词）")
     parser.add_argument("--search-limit", type=int, default=50,
                         help="--search 的最大返回条数（默认 50）")
+    parser.add_argument("--list-members", action="store_true",
+                        help="列出指定群内发过言的成员（需配合 --gid）")
+    parser.add_argument("--export", action="store_true",
+                        help="导出指定群某成员的发言为 JSON（用于 AI 分析）；需配合 --gid 与成员标识")
+    parser.add_argument("--sender-name", default="",
+                        help="--export 时按发送者昵称筛选")
+    parser.add_argument("--sender-id", type=int, default=0,
+                        help="--export 时按发送者 ID 筛选（比昵称更稳定）")
+    parser.add_argument("--until", default="",
+                        help="--export 的结束时间（日期如 2026-07-14 或毫秒时间戳，CST 口径，开区间）")
+    parser.add_argument("--output", "-o", default="",
+                        help="--export 的输出文件路径（默认 项目目录/export_<gid>_<sender>.json）")
     args = parser.parse_args()
 
     level = logging.DEBUG if args.verbose else logging.INFO
@@ -389,6 +452,15 @@ def main():
 
     if args.search:
         _do_search(db_path, args.search, args.search_limit)
+        return
+
+    if args.list_members:
+        _do_list_members(db_path, args.gid, log)
+        return
+
+    if args.export:
+        _do_export(db_path, args.gid, args.sender_name, args.sender_id,
+                   args.since, args.until, args.output, log)
         return
 
     try:

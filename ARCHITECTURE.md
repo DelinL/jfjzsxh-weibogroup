@@ -87,7 +87,7 @@ crawl.main()
   │                          ↓
   │                   db.set_cookie()
   │
-  ├─ 若 --stats / --list-groups / --search / --add-skip-gid ...
+  ├─ 若 --stats / --list-groups / --search / --list-members / --export / --add-skip-gid ...
   │     → 直接调 db.* 静态查询，不构造 Crawler
   │
   └─ 否则 → Crawler(db_path)
@@ -103,7 +103,22 @@ crawl.main()
               ├─ 若 --download → download_all_media(skip_video)
               │                    └─ 循环 download_pending() 直到空
               │
-              └─ 若 --probe-boundary → probe_boundary(gid)
+              ├─ 若 --probe-boundary → probe_boundary(gid)
+  │
+  ├─ 若 --export --gid GID --sender-name/id ...
+  │     → _do_export(db_path, gid, sender_name, sender_id, since, until, output)
+  │          ├─ _parse_since(since/until)                   ← 日期→毫秒（crawl.py）
+  │          ├─ export.export_member_messages(db_path, ...) ← 委托导出模块
+  │          │    ├─ export.get_member_messages(gid, ...)   ← 查询本人发言
+  │          │    ├─ db.get_group_list()                    ← 取群名
+  │          │    ├─ export.build_export_json(rows, ...)    ← 组装 JSON
+  │          │    └─ json.dump() → export_<gid>_<name>.json ← 写文件
+  │          └─ 日志输出
+  │
+  └─ 若 --list-members --gid GID
+        → _do_list_members(db_path, gid)
+             └─ export.list_members(db_path, gid)
+                  └─ export.get_members(gid)                ← 列出发言成员
 ```
 
 ---
@@ -114,10 +129,11 @@ crawl.main()
 
 | 模块 | 行数 | 职责 | 对外接口 |
 |------|------|------|---------|
-| `crawl.py` | ~400 | CLI 入口、参数解析、流程编排 | `main()` |
+| `crawl.py` | ~480 | CLI 入口、参数解析、流程编排 | `main()` / `_do_export` / `_do_list_members` |
 | `weibo_im/crawler.py` | ~600 | API 客户端 + 爬取业务 | `Crawler` 类 |
 | `weibo_im/parser.py` | ~250 | 原始消息 → 统一字典 | `parse_message` / `parse_messages` |
-| `weibo_im/db.py` | ~480 | SQLite + FTS5 读写 | `init_db` / `save_*` / `get_*` / `get_stats` |
+| `weibo_im/db.py` | ~490 | SQLite + FTS5 读写 | `init_db` / `save_*` / `get_*` / `get_stats` |
+| `weibo_im/export.py` | ~200 | 成员发言导出（用于 AI 分析） | `get_members` / `get_member_messages` / `build_export_json` / `export_member_messages` / `list_members` |
 | `weibo_im/media.py` | ~230 | 媒体文件下载 | `download_file` / `download_pending` |
 | `weibo_im/links.py` | ~280 | 外部链接文件扫描下载 | `scan_and_download_messages` |
 | `weibo_im/types.py` | ~75 | 类型码常量与工具 | `MSG_TYPES` / `MEDIA_TYPES` / `VIDEO_MEDIA_TYPES` |
@@ -135,8 +151,10 @@ crawl.main()
 
 **特殊处理：**
 - `--renew-cookie` 走 `_renew_cookie()`（含 Playwright），与其他分支互斥。
-- `--stats` / `--list-groups` / `--list-skip` / `--add-skip-gid` / `--search` 只需初始化 DB，不构造 `Crawler`（不需要 cookie）。
+- `--stats` / `--list-groups` / `--list-skip` / `--add-skip-gid` / `--search` / `--list-members` / `--export` 只需初始化 DB，不构造 `Crawler`（不需要 cookie）。
 - 其他爬取/下载命令先构造 `Crawler`（这步会校验 cookie 是否存在）。
+- `--export` 命令接受 `--gid`（必选）+ `--sender-name` 或 `--sender-id`（至少一个）+ 可选 `--since` / `--until` / `--output` 参数，将指定成员在指定群的本人发言导出为 JSON 文件（用于 AI 分析）。
+- `--list-members` 命令搭配 `--gid` 列出群内发过言的成员及其发言数/最近发言时间，便于定位准确的成员标识（昵称或 sender_id）。
 
 #### `weibo_im/crawler.py` — 业务层
 
@@ -181,6 +199,26 @@ crawl.main()
 - **自动建表**：`init_db()` 用 `CREATE TABLE IF NOT EXISTS` + FTS5 + 触发器。
 - **幂等写入**：所有 `save_*` 用 `INSERT OR IGNORE`（依赖 UNIQUE 约束）。
 - **索引**：`gid` / `msg_type` / `created_at` / `mid` / `fid` / `status` 上有索引。
+
+#### `weibo_im/export.py` — 导出层（新增）
+
+独立的成员发言导出模块，纯读操作，不修改任何表数据。
+
+| 函数 | 职责 |
+|------|------|
+| `ms_to_cst(ms)` | 毫秒时间戳转 CST 格式化字符串 |
+| `get_members(gid)` | 查询群内发过言的成员（sender_id/昵称/发言数/最近时间），按最近发言倒序；仅统计 msg_type 100/321 的真实用户发言 |
+| `get_member_messages(gid, sender_id, sender_name, since_ms, until_ms, msg_types)` | 按群+成员+时间范围+消息类型筛选发言，按 created_at ASC 排序 |
+| `build_export_json(rows, gid, sender_id, sender_name, group_name, since_ms, until_ms)` | 将查询结果组装为 `{"meta": {...}, "messages": [...]}` JSON 结构 |
+| `export_member_messages(db_path, gid, ...)` | 完整导出流程：初始化 DB → 查询 → 组装 JSON → 写文件，返回结果 dict |
+| `list_members(db_path, gid)` | 初始化 DB 后查询并打印群成员列表 |
+
+设计要点：
+- **依赖 db.py 只读接口**：通过 `set_db_path` / `init_db` / `get_conn` / `get_group_list` 访问数据库。
+- **无需 Cookie / 网络**：纯本地 DB 查询 + JSON 序列化。
+- **输出格式**：JSON 含 `meta`（群/成员/条数/时间范围/过滤条件）与 `messages` 数组，每条同时给出 `created_at`（UTC 毫秒）和 `created_at_cst`（CST 字符串），可直接喂给大模型。
+- **默认输出路径**：`<项目根>/export_<gid>_<sender>.json`，可通过 `--output` 自定义。
+- 行数 ~200，是项目中行数最少、耦合最轻的模块。
 
 #### `weibo_im/media.py` — 媒体下载
 
@@ -285,6 +323,59 @@ download_pending(skip_video=True)
     ▼
 [视频全部 skipped，不再进下载队列]
 ```
+
+### 4.4 成员发言导出流程
+
+为 AI 分析提供指定群成员的发言导出能力（`--export`），纯读操作，不修改任何表数据。
+
+```
+[用户指定 --gid + --sender-name|--sender-id + 可选 --since/--until]
+    │
+    │  _parse_since() 将日期/时间戳字符串统一为 UTC 毫秒
+    ▼
+[db.get_member_messages(gid, sender_id, sender_name, since_ms, until_ms)]
+    │
+    │  SELECT mid, msg_type, sender_id, sender_name, text, created_at, ...
+    │  FROM messages
+    │  WHERE gid=? AND msg_type IN (100,321)          ← 仅真实用户发言
+    │    AND (sender_id=? 若传入)                      ← 按 ID 筛选（稳定）
+    │    AND (sender_name=? 若传入)                    ← 按昵称筛选（可读）
+    │    AND (created_at>=? 若指定 --since)           ← 时间下界
+    │    AND (created_at<?  若指定 --until)           ← 时间上界（开区间）
+    │  ORDER BY created_at ASC                        ← 按时间线供 AI 分析
+    ▼
+[_do_export 组装 JSON]
+    │
+    │  {
+    │    "meta": {
+    │      "exported_at": "2026-07-14T12:00:00+0800",   ← 导出时间
+    │      "group": {"gid": ..., "name": "..."},         ← 群信息
+    │      "member": {"sender_id": ..., "sender_name": "..."}, ← 成员标识
+    │      "filters": {"msg_types": [100,321], "since_ms": ..., "until_ms": ...},
+    │      "message_count": N,                           ← 导出条数
+    │      "time_range": {"start_cst": "...", "end_cst": "..."}
+    │    },
+    │    "messages": [
+    │      {"mid": ..., "created_at": 1699..., "created_at_cst": "2026-...",
+    │       "sender_name": "...", "msg_type": 321, "text": "...", ...}
+    │    ]
+    │  }
+    ▼
+[写入 JSON 文件]
+    │
+    │  默认路径: 项目根/export_<gid>_<sender>.json
+    │  可通过 --output/-o 自定义
+```
+
+**设计要点**：
+
+- **纯读操作**：不修改任何表数据，不依赖 Cookie，不构造 Crawler。
+- **消息类型限定**：默认仅导出 msg_type 100（微博分享）和 321（普通消息），排除 322（系统消息）、332（撤回）等非用户发言。
+- **时间双表示**：每条消息同时输出 `created_at`（UTC 毫秒，原始值）和 `created_at_cst`（CST 字符串，人类可读），meta 中也提供 `since_cst` / `until_cst`。
+- **空结果也是合法 JSON**：`messages` 数组为空时仍输出完整 meta 结构，控制台提示用 `--list-members` 核对标识。
+- **`--list-members`** 作为定位辅助：先列出群内成员（sender_id / 昵称 / 发言数 / 最近时间），帮用户找到准确的成员标识，再用于 `--export`。
+
+> 跨语言迁移时，导出模块只需实现对应的 DB 查询 + JSON 序列化，不涉及任何网络请求或状态变更，是最简单的模块之一。
 
 ---
 
@@ -516,6 +607,64 @@ Phase 3: 翻页到空
 | Cookie 存储 | DB config 表 | 单一数据源，不靠文件 |
 | 时区 | 业务统一 CST | 不依赖系统时区 |
 
+### 7.4 导出 JSON 结构（用于 AI 分析）
+
+`--export` 输出的 JSON 文件包含两层：`meta`（元信息）和 `messages`（发言数组）。
+
+```json
+{
+  "meta": {
+    "exported_at": "2026-07-14T12:00:00+0800",
+    "group": {"gid": 123456, "name": "某群组"},
+    "member": {"sender_id": 789, "sender_name": "某成员"},
+    "filters": {
+      "msg_types": [100, 321],
+      "since_ms": 1750113600000,
+      "until_ms": null,
+      "since_cst": "2026-06-16 21:20:00",
+      "until_cst": null
+    },
+    "message_count": 42,
+    "time_range": {
+      "start_cst": "2026-06-16 21:20:00",
+      "end_cst": "2026-07-14 11:30:00"
+    }
+  },
+  "messages": [
+    {
+      "mid": "5303944857256012",
+      "created_at": 1750113600000,
+      "created_at_cst": "2026-06-16 21:20:00",
+      "sender_id": 789,
+      "sender_name": "某成员",
+      "msg_type": 321,
+      "msg_type_name": "普通消息",
+      "media_type": 0,
+      "text": "发言内容...",
+      "fid": "",
+      "media_orig_url": "",
+      "url_objects": ""
+    }
+  ]
+}
+```
+
+**字段说明**：
+
+| 字段 | 说明 |
+|------|------|
+| `meta.exported_at` | 导出时间（CST 时区） |
+| `meta.group` | 群 gid 和名称（从 groups 表查询） |
+| `meta.member` | 导出时指定的成员标识（sender_id/sender_name 可仅有一个） |
+| `meta.filters` | 导出过滤条件，`since_cst`/`until_cst` 为毫秒对应的 CST 字符串 |
+| `meta.time_range` | 实际导出数据的时间范围 |
+| `messages[].created_at` | UTC 毫秒时间戳（原始值） |
+| `messages[].created_at_cst` | CST 格式化字符串（方便人类阅读） |
+| `messages[].text` | 消息正文（纯文本，不含 HTML） |
+| `messages[].url_objects` | 消息中附带的外部链接信息（JSON 字符串） |
+
+> 导出为纯 JSON 文件，无额外依赖，可直接喂给大模型或任意 JSON 解析器。空结果也输出合法 JSON（`messages: []`）。
+
 ---
 
 ## 8. 并发与一致性
@@ -568,13 +717,27 @@ logger 命名约定：
 | `⇣ [群名] +N 条新消息` | 增量成功 | — |
 | `⬇ [群名] 回填 N 条历史` | 回填成功 | — |
 
-### 9.3 统计命令
+### 9.3 统计与导出命令
 
 `--stats` 输出（基于 `get_stats()`）：
 
 ```
 消息总数 / 有消息的群 / 群总数
 媒体已下载 / 待下载 / 失败 / 跳过
+```
+
+`--list-members --gid GID` 输出：
+
+```
+群成员列表（sender_id / 昵称 / 发言数 / 最近发言时间）
+用于定位 --export 所需的成员标识
+```
+
+`--export --gid GID --sender-name/id ...` 输出：
+
+```
+导出 N 条发言 → export_<gid>_<sender>.json
+时间范围: YYYY-MM-DD HH:MM:SS ~ YYYY-MM-DD HH:MM:SS (CST)
 ```
 
 ### 9.4 定时任务
@@ -610,7 +773,8 @@ logger 命名约定：
 
 可选
   9. probe_boundary  ← §5.2 边界探测
- 10. FTS5 全文搜索   ← 数据库相关
+ 10. 成员发言导出     ← §4.4 导出流程（仅 DB 查询 + JSON 序列化，无网络依赖）
+ 11. FTS5 全文搜索   ← 数据库相关
 ```
 
 ### 10.2 Java + MySQL 迁移示例架构
@@ -645,7 +809,9 @@ src/main/java/weiboim/
 │   ├── MessageRepository.java
 │   ├── GroupRepository.java
 │   ├── MediaFileRepository.java
-│   └── ConfigRepository.java
+│   ├── ConfigRepository.java
+│   ├── MemberExportRepository.java    ← get_member_messages / get_members
+│   └── ExportService.java            ← _do_export 对应
 │
 └── util/
     ├── Backoff.java                  ← 重试退避

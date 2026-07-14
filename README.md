@@ -165,6 +165,25 @@ uv run crawl.py
 | `uv run crawl.py --search 关键词` | FTS5 全文搜索消息（按时间倒序）。 |
 | `uv run crawl.py --search 关键词 --search-limit 100` | 限制返回条数（默认 50）。 |
 
+### 4.6 导出群成员发言（用于 AI 分析）
+
+把指定群内某个成员本人的发言导出为 JSON，便于直接喂给大模型或程序解析。
+
+| 命令 | 作用 |
+|------|------|
+| `uv run crawl.py --list-members --gid GID` | 列出该群发过言的成员（sender_id / 昵称 / 发言数 / 最近发言时间），用于定位准确标识。 |
+| `uv run crawl.py --export --gid GID --sender-name 昵称` | 按昵称导出该成员在该群的发言为 JSON。 |
+| `uv run crawl.py --export --gid GID --sender-id 12345` | 按发送者 ID 导出（比昵称稳定，不受改名影响）。 |
+| `... --since 2026-01-01 --until 2026-07-14` | 可选：限定时间范围（CST 口径，日期或毫秒时间戳；`--until` 为开区间）。 |
+| `... --output D:\out\alice.json` | 可选：指定输出路径（默认 `export_<gid>_<sender>.json` 在项目根目录）。 |
+
+**导出说明：**
+
+- 仅导出该成员**本人**发言，消息类型限定为普通消息(321)与微博分享(100)，自动排除系统消息（入群/撤回/通知等）。
+- 输出 JSON 含 `meta`（群、成员、条数、时间范围、过滤条件）与 `messages` 数组（按时间升序）；每条同时给出 `created_at`（UTC 毫秒）与 `created_at_cst`（CST 字符串）。
+- 同一昵称在不同群可能对应不同人，故 `--export` 必须配合 `--gid`；不确定昵称时先用 `--list-members --gid GID` 查。
+- `--sender-name` 与 `--sender-id` 至少给一个，可同时给（取交集）；0 条结果也会写出合法 JSON（空 `messages` 数组）并在控制台提示。
+
 ---
 
 ## 5. 数据存储规范
