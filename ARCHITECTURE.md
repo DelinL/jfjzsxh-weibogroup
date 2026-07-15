@@ -106,13 +106,13 @@ crawl.main()
               ├─ 若 --probe-boundary → probe_boundary(gid)
   │
   ├─ 若 --export --gid GID --sender-name/id ...
-  │     → _do_export(db_path, gid, sender_name, sender_id, since, until, output)
+  │     → _do_export(db_path, gid, sender_name, sender_id, since, until, output, compact)
   │          ├─ _parse_since(since/until)                   ← 日期→毫秒（crawl.py）
   │          ├─ export.export_member_messages(db_path, ...) ← 委托导出模块
   │          │    ├─ export.get_member_messages(gid, ...)   ← 查询本人发言
   │          │    ├─ db.get_group_list()                    ← 取群名
-  │          │    ├─ export.build_export_json(rows, ...)    ← 组装 JSON
-  │          │    └─ json.dump() → export_<gid>_<name>.json ← 写文件
+  │          │    ├─ export.build_export_json(rows)         ← 组装 JSON 列表
+  │          │    └─ json.dump() → export_<gid>_<name>.json ← 写文件（compact 时 minified）
   │          └─ 日志输出
   │
   └─ 若 --list-members --gid GID
@@ -153,7 +153,7 @@ crawl.main()
 - `--renew-cookie` 走 `_renew_cookie()`（含 Playwright），与其他分支互斥。
 - `--stats` / `--list-groups` / `--list-skip` / `--add-skip-gid` / `--search` / `--list-members` / `--export` 只需初始化 DB，不构造 `Crawler`（不需要 cookie）。
 - 其他爬取/下载命令先构造 `Crawler`（这步会校验 cookie 是否存在）。
-- `--export` 命令接受 `--gid`（必选）+ `--sender-name` 或 `--sender-id`（至少一个）+ 可选 `--since` / `--until` / `--output` 参数，将指定成员在指定群的本人发言导出为 JSON 文件（用于 AI 分析）。
+- `--export` 命令接受 `--gid`（必选）+ `--sender-name` 或 `--sender-id`（至少一个）+ 可选 `--since` / `--until` / `--output` / `--compact` 参数，将指定成员在指定群的本人发言导出为 JSON 文件（用于 AI 分析）。`--compact` 输出紧凑 JSON（去缩进、去空格），减小文件体积。
 - `--list-members` 命令搭配 `--gid` 列出群内发过言的成员及其发言数/最近发言时间，便于定位准确的成员标识（昵称或 sender_id）。
 
 #### `weibo_im/crawler.py` — 业务层
@@ -209,14 +209,15 @@ crawl.main()
 | `ms_to_cst(ms)` | 毫秒时间戳转 CST 格式化字符串 |
 | `get_members(gid)` | 查询群内发过言的成员（sender_id/昵称/发言数/最近时间），按最近发言倒序；仅统计 msg_type 100/321 的真实用户发言 |
 | `get_member_messages(gid, sender_id, sender_name, since_ms, until_ms, msg_types)` | 按群+成员+时间范围+消息类型筛选发言，按 created_at ASC 排序 |
-| `build_export_json(rows, gid, sender_id, sender_name, group_name, since_ms, until_ms)` | 将查询结果组装为 `{"meta": {...}, "messages": [...]}` JSON 结构 |
-| `export_member_messages(db_path, gid, ...)` | 完整导出流程：初始化 DB → 查询 → 组装 JSON → 写文件，返回结果 dict |
+| `build_export_json(rows)` | 将查询结果组装为发言列表，每条仅含 `sender_name` 与 `text` 两项 |
+| `export_member_messages(db_path, gid, ..., compact=False)` | 完整导出流程：初始化 DB → 查询 → 组装 JSON → 写文件，返回结果 dict；compact=True 时输出紧凑 JSON |
 | `list_members(db_path, gid)` | 初始化 DB 后查询并打印群成员列表 |
 
 设计要点：
 - **依赖 db.py 只读接口**：通过 `set_db_path` / `init_db` / `get_conn` / `get_group_list` 访问数据库。
 - **无需 Cookie / 网络**：纯本地 DB 查询 + JSON 序列化。
-- **输出格式**：JSON 含 `meta`（群/成员/条数/时间范围/过滤条件）与 `messages` 数组，每条同时给出 `created_at`（UTC 毫秒）和 `created_at_cst`（CST 字符串），可直接喂给大模型。
+- **输出格式**：导出文件为纯 JSON 数组，无 `meta` 包裹，每条元素仅含 `sender_name`（发言者昵称）和 `text`（消息正文）两项，字段精简、可直接喂给大模型做发言分析。
+- **紧凑模式**：`export_member_messages` 的 `compact=True`（CLI 对应 `--compact`）使用 `separators=(",", ":")` 去掉缩进与多余空白，输出 minified JSON，文件体积通常减到默认的 1/3~1/2，适合直接喂大模型或网络传输；默认 `compact=False` 保留 2 空格缩进便于人工阅读。
 - **默认输出路径**：`<项目根>/export_<gid>_<sender>.json`，可通过 `--output` 自定义。
 - 行数 ~200，是项目中行数最少、耦合最轻的模块。
 
@@ -346,20 +347,10 @@ download_pending(skip_video=True)
     ▼
 [_do_export 组装 JSON]
     │
-    │  {
-    │    "meta": {
-    │      "exported_at": "2026-07-14T12:00:00+0800",   ← 导出时间
-    │      "group": {"gid": ..., "name": "..."},         ← 群信息
-    │      "member": {"sender_id": ..., "sender_name": "..."}, ← 成员标识
-    │      "filters": {"msg_types": [100,321], "since_ms": ..., "until_ms": ...},
-    │      "message_count": N,                           ← 导出条数
-    │      "time_range": {"start_cst": "...", "end_cst": "..."}
-    │    },
-    │    "messages": [
-    │      {"mid": ..., "created_at": 1699..., "created_at_cst": "2026-...",
-    │       "sender_name": "...", "msg_type": 321, "text": "...", ...}
-    │    ]
-    │  }
+    │  [
+    │    {"sender_name": "...", "text": "..."},
+    │    {"sender_name": "...", "text": "..."}
+    │  ]
     ▼
 [写入 JSON 文件]
     │
@@ -371,8 +362,9 @@ download_pending(skip_video=True)
 
 - **纯读操作**：不修改任何表数据，不依赖 Cookie，不构造 Crawler。
 - **消息类型限定**：默认仅导出 msg_type 100（微博分享）和 321（普通消息），排除 322（系统消息）、332（撤回）等非用户发言。
-- **时间双表示**：每条消息同时输出 `created_at`（UTC 毫秒，原始值）和 `created_at_cst`（CST 字符串，人类可读），meta 中也提供 `since_cst` / `until_cst`。
-- **空结果也是合法 JSON**：`messages` 数组为空时仍输出完整 meta 结构，控制台提示用 `--list-members` 核对标识。
+- **导出为纯数组**：输出文件不含任何 `meta` 包裹，直接是发言列表，每条仅含 `sender_name`（发言者昵称）与 `text`（消息正文）两项，省略时间戳、消息类型、媒体等冗余字段，聚焦发言内容本身，便于直接用于 AI 分析。
+- **紧凑模式（可选）**：加 `--compact` 时 `json.dump` 使用 `separators=(",", ":")` 且无缩进，输出单行 minified JSON，显著减小体积；默认带 2 空格缩进，便于人工查看。
+- **空结果也是合法 JSON**：列表为空时仍输出 `[]`，控制台提示用 `--list-members` 核对标识。
 - **`--list-members`** 作为定位辅助：先列出群内成员（sender_id / 昵称 / 发言数 / 最近时间），帮用户找到准确的成员标识，再用于 `--export`。
 
 > 跨语言迁移时，导出模块只需实现对应的 DB 查询 + JSON 序列化，不涉及任何网络请求或状态变更，是最简单的模块之一。
@@ -609,61 +601,25 @@ Phase 3: 翻页到空
 
 ### 7.4 导出 JSON 结构（用于 AI 分析）
 
-`--export` 输出的 JSON 文件包含两层：`meta`（元信息）和 `messages`（发言数组）。
+`--export` 输出的 JSON 文件是一个纯数组，每个元素是一条发言记录。
 
 ```json
-{
-  "meta": {
-    "exported_at": "2026-07-14T12:00:00+0800",
-    "group": {"gid": 123456, "name": "某群组"},
-    "member": {"sender_id": 789, "sender_name": "某成员"},
-    "filters": {
-      "msg_types": [100, 321],
-      "since_ms": 1750113600000,
-      "until_ms": null,
-      "since_cst": "2026-06-16 21:20:00",
-      "until_cst": null
-    },
-    "message_count": 42,
-    "time_range": {
-      "start_cst": "2026-06-16 21:20:00",
-      "end_cst": "2026-07-14 11:30:00"
-    }
-  },
-  "messages": [
-    {
-      "mid": "5303944857256012",
-      "created_at": 1750113600000,
-      "created_at_cst": "2026-06-16 21:20:00",
-      "sender_id": 789,
-      "sender_name": "某成员",
-      "msg_type": 321,
-      "msg_type_name": "普通消息",
-      "media_type": 0,
-      "text": "发言内容...",
-      "fid": "",
-      "media_orig_url": "",
-      "url_objects": ""
-    }
-  ]
-}
+[
+  {
+    "sender_name": "某成员",
+    "text": "发言内容..."
+  }
+]
 ```
 
 **字段说明**：
 
 | 字段 | 说明 |
 |------|------|
-| `meta.exported_at` | 导出时间（CST 时区） |
-| `meta.group` | 群 gid 和名称（从 groups 表查询） |
-| `meta.member` | 导出时指定的成员标识（sender_id/sender_name 可仅有一个） |
-| `meta.filters` | 导出过滤条件，`since_cst`/`until_cst` 为毫秒对应的 CST 字符串 |
-| `meta.time_range` | 实际导出数据的时间范围 |
-| `messages[].created_at` | UTC 毫秒时间戳（原始值） |
-| `messages[].created_at_cst` | CST 格式化字符串（方便人类阅读） |
-| `messages[].text` | 消息正文（纯文本，不含 HTML） |
-| `messages[].url_objects` | 消息中附带的外部链接信息（JSON 字符串） |
+| `[].sender_name` | 发言者昵称 |
+| `[].text` | 消息正文（纯文本，不含 HTML） |
 
-> 导出为纯 JSON 文件，无额外依赖，可直接喂给大模型或任意 JSON 解析器。空结果也输出合法 JSON（`messages: []`）。
+> 导出为纯 JSON 数组文件，无 `meta` 包裹、无额外依赖，可直接喂给大模型或任意 JSON 解析器。空结果也输出合法 JSON（`[]`）。
 
 ---
 
@@ -738,6 +694,7 @@ logger 命名约定：
 ```
 导出 N 条发言 → export_<gid>_<sender>.json
 时间范围: YYYY-MM-DD HH:MM:SS ~ YYYY-MM-DD HH:MM:SS (CST)
+# 加 --compact 则输出紧凑（minified）JSON，无缩进/空格
 ```
 
 ### 9.4 定时任务

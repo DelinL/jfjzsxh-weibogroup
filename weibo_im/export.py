@@ -104,61 +104,19 @@ def get_member_messages(
 # ── JSON 组装 ───────────────────────────────────────────────
 
 
-def build_export_json(
-    rows: list[dict],
-    gid: int,
-    sender_id: int | None,
-    sender_name: str | None,
-    group_name: str,
-    since_ms: int | None,
-    until_ms: int | None,
-) -> dict:
-    """将查询结果组装为适合 AI 分析的导出 JSON 结构。
+def build_export_json(rows: list[dict]) -> list[dict]:
+    """将查询结果组装为适合 AI 分析的导出数据。
 
-    返回 {"meta": {...}, "messages": [...]}，其中 meta 含群/成员/条数/时间范围/
-    过滤条件，messages 数组中每条含 created_at（毫秒）与 created_at_cst（CST 字符串）。
+    返回消息列表，每条仅含 sender_name（发言者昵称）与 text（正文）两项，
+    按 created_at ASC 排列，契合按时间线的 AI 序列分析。
     """
-    msgs = []
-    for r in rows:
-        ts = r.get("created_at") or 0
-        cst_str = ms_to_cst(ts) or ""
-        msgs.append({
-            "mid": r.get("mid"),
-            "created_at": ts,
-            "created_at_cst": cst_str,
-            "sender_id": r.get("sender_id"),
+    return [
+        {
             "sender_name": r.get("sender_name") or "",
-            "msg_type": r.get("msg_type"),
-            "msg_type_name": r.get("msg_type_name") or "",
-            "media_type": r.get("media_type"),
             "text": r.get("text") or "",
-            "fid": r.get("fid") or "",
-            "media_orig_url": r.get("media_orig_url") or "",
-            "url_objects": r.get("url_objects") or "",
-        })
-
-    start_cst = msgs[0]["created_at_cst"] if msgs else ""
-    end_cst = msgs[-1]["created_at_cst"] if msgs else ""
-    return {
-        "meta": {
-            "exported_at": datetime.now(tz=CST).strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "group": {"gid": gid, "name": group_name},
-            "member": {
-                "sender_id": sender_id or None,
-                "sender_name": sender_name or None,
-            },
-            "filters": {
-                "msg_types": [100, 321],
-                "since_ms": since_ms,
-                "until_ms": until_ms,
-                "since_cst": ms_to_cst(since_ms),
-                "until_cst": ms_to_cst(until_ms),
-            },
-            "message_count": len(msgs),
-            "time_range": {"start_cst": start_cst, "end_cst": end_cst},
-        },
-        "messages": msgs,
-    }
+        }
+        for r in rows
+    ]
 
 
 # ── 高级编排（含 DB 初始化 + 文件写入）─────────────────────
@@ -172,10 +130,15 @@ def export_member_messages(
     since_ms: int | None = None,
     until_ms: int | None = None,
     output_path: str | None = None,
+    compact: bool = False,
 ) -> dict:
     """导出指定群内某成员本人发言为 JSON 文件。
 
     完整流程：初始化 DB 连接 → 查询消息 → 查询群名 → 组装 JSON → 写入文件。
+
+    compact=True 时输出紧凑（minified）JSON：去掉缩进与多余空白、字段间
+    无空格，显著减小文件体积，适合直接喂给大模型或网络传输；默认 False
+    保留 2 空格缩进，便于人工阅读。
 
     返回结果字典:
         {"path": str,          # 输出文件路径
@@ -205,10 +168,7 @@ def export_member_messages(
             group_name = g.get("name", "")
             break
 
-    payload = build_export_json(
-        rows=rows, gid=gid, sender_id=sid, sender_name=sname,
-        group_name=group_name, since_ms=since_ms, until_ms=until_ms,
-    )
+    payload = build_export_json(rows)
 
     # 确定输出路径
     if not output_path:
@@ -217,11 +177,14 @@ def export_member_messages(
         output_path = str(Path(__file__).resolve().parent.parent / f"export_{gid}_{safe}.json")
 
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+        if compact:
+            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+        else:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    msgs = payload["messages"]
-    start_cst = msgs[0]["created_at_cst"] if msgs else ""
-    end_cst = msgs[-1]["created_at_cst"] if msgs else ""
+    msgs = payload
+    start_cst = ms_to_cst(rows[0].get("created_at")) if rows else ""
+    end_cst = ms_to_cst(rows[-1].get("created_at")) if rows else ""
 
     log.info("已导出 %d 条发言 → %s", len(msgs), output_path)
 

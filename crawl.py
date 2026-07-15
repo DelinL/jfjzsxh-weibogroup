@@ -281,7 +281,7 @@ def _do_list_members(db_path: str, gid: int, log: logging.Logger):
 
 
 def _do_export(db_path: str, gid: int, sender_name: str, sender_id: int,
-               since: str, until: str, output: str, log: logging.Logger):
+               since: str, until: str, output: str, compact: bool, log: logging.Logger):
     """导出指定群内某成员本人发言为 JSON 文件（用于 AI 分析）。
 
     参数校验后委托 weibo_im.export 模块完成 DB 查询、JSON 组装、文件写入。
@@ -304,6 +304,7 @@ def _do_export(db_path: str, gid: int, sender_name: str, sender_id: int,
         sender_id=sender_id or None,
         since_ms=since_ms, until_ms=until_ms,
         output_path=output or None,
+        compact=compact,
     )
 
     count = result["count"]
@@ -360,6 +361,8 @@ def main():
                         help="--export 的结束时间（日期如 2026-07-14 或毫秒时间戳，CST 口径，开区间）")
     parser.add_argument("--output", "-o", default="",
                         help="--export 的输出文件路径（默认 项目目录/export_<gid>_<sender>.json）")
+    parser.add_argument("--compact", action="store_true",
+                        help="--export 时输出紧凑（minified）JSON，去掉缩进与多余空白，减小文件体积")
     args = parser.parse_args()
 
     level = logging.DEBUG if args.verbose else logging.INFO
@@ -460,7 +463,7 @@ def main():
 
     if args.export:
         _do_export(db_path, args.gid, args.sender_name, args.sender_id,
-                   args.since, args.until, args.output, log)
+                   args.since, args.until, args.output, args.compact, log)
         return
 
     try:
