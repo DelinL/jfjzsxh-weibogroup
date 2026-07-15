@@ -210,15 +210,17 @@ crawl.main()
 | `get_members(gid)` | 查询群内发过言的成员（sender_id/昵称/发言数/最近时间），按最近发言倒序；仅统计 msg_type 100/321 的真实用户发言 |
 | `get_member_messages(gid, sender_id, sender_name, since_ms, until_ms, msg_types)` | 按群+成员+时间范围+消息类型筛选发言，按 created_at ASC 排序 |
 | `build_export_json(rows)` | 将查询结果组装为发言列表，每条仅含 `sender_name` 与 `text` 两项 |
-| `export_member_messages(db_path, gid, ..., compact=False)` | 完整导出流程：初始化 DB → 查询 → 组装 JSON → 写文件，返回结果 dict；compact=True 时输出紧凑 JSON |
+| `export_member_messages(db_path, gid, ..., compact=False, fmt="json")` | 完整导出流程：初始化 DB → 查询 → 组装数据 → 写文件，返回结果 dict；fmt="csv" 时输出 CSV，compact=True 时输出紧凑 JSON |
 | `list_members(db_path, gid)` | 初始化 DB 后查询并打印群成员列表 |
 
 设计要点：
 - **依赖 db.py 只读接口**：通过 `set_db_path` / `init_db` / `get_conn` / `get_group_list` 访问数据库。
-- **无需 Cookie / 网络**：纯本地 DB 查询 + JSON 序列化。
-- **输出格式**：导出文件为纯 JSON 数组，无 `meta` 包裹，每条元素仅含 `sender_name`（发言者昵称）和 `text`（消息正文）两项，字段精简、可直接喂给大模型做发言分析。
-- **紧凑模式**：`export_member_messages` 的 `compact=True`（CLI 对应 `--compact`）使用 `separators=(",", ":")` 去掉缩进与多余空白，输出 minified JSON，文件体积通常减到默认的 1/3~1/2，适合直接喂大模型或网络传输；默认 `compact=False` 保留 2 空格缩进便于人工阅读。
-- **默认输出路径**：`<项目根>/export_<gid>_<sender>.json`，可通过 `--output` 自定义。
+- **无需 Cookie / 网络**：纯本地 DB 查询 + JSON/CSV 序列化。
+- **输出格式**：导出文件每条仅含 `sender_name`（发言者昵称）和 `text`（消息正文）两项。
+  - `fmt="json"`（默认）：纯 JSON 数组，无 `meta` 包裹，可直接喂给大模型。
+  - `fmt="csv"`：CSV 文件，表头为 `sender_name,text`，UTF-8-SIG 编码（Excel 可直接打开且中文不乱码）。
+- **紧凑模式**：`export_member_messages` 的 `compact=True`（CLI 对应 `--compact`）使用 `separators=(",", ":")` 去掉缩进与多余空白，输出 minified JSON，文件体积通常减到默认的 1/3~1/2，适合直接喂大模型或网络传输；默认 `compact=False` 保留 2 空格缩进便于人工阅读（该参数仅对 JSON 生效，CSV 无影响）。
+- **默认输出路径**：`<项目根>/export_<gid>_<sender>.json`（CSV 为 `.csv`），可通过 `--output` 自定义。
 - 行数 ~200，是项目中行数最少、耦合最轻的模块。
 
 #### `weibo_im/media.py` — 媒体下载
@@ -695,6 +697,7 @@ logger 命名约定：
 导出 N 条发言 → export_<gid>_<sender>.json
 时间范围: YYYY-MM-DD HH:MM:SS ~ YYYY-MM-DD HH:MM:SS (CST)
 # 加 --compact 则输出紧凑（minified）JSON，无缩进/空格
+# 加 --format csv 则输出 export_<gid>_<sender>.csv（表头 sender_name,text）
 ```
 
 ### 9.4 定时任务

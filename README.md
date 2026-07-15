@@ -177,14 +177,17 @@ uv run crawl.py
 | `... --since 2026-01-01 --until 2026-07-14` | 可选：限定时间范围（CST 口径，日期或毫秒时间戳；`--until` 为开区间）。 |
 | `... --output D:\out\alice.json` | 可选：指定输出路径（默认 `export_<gid>_<sender>.json` 在项目根目录）。 |
 | `... --compact` | 可选：输出紧凑（minified）JSON，去掉缩进与多余空白，减小文件体积。 |
+| `... --format csv` | 可选：输出 CSV 格式（表头 `sender_name,text`，UTF-8-SIG 编码，Excel 可直接打开）。 |
 
 **导出说明：**
 
 - 仅导出该成员**本人**发言，消息类型限定为普通消息(321)与微博分享(100)，自动排除系统消息（入群/撤回/通知等）。
-- 输出文件是一个**纯 JSON 数组**（无 `meta` 包裹），按时间升序排列；每条仅含 `sender_name`（发言者昵称）与 `text`（消息正文）两项，聚焦发言内容本身，便于直接喂给大模型。
-- 默认带 2 空格缩进便于阅读；加 `--compact` 后输出单行 minified JSON，体积通常减到 1/3~1/2，适合直接喂大模型或网络传输。
+- 输出文件每条仅含 `sender_name`（发言者昵称）与 `text`（消息正文）两项。
+  - 默认 `--format json`：纯 JSON 数组（无 `meta` 包裹），按时间升序，便于直接喂给大模型。
+  - `--format csv`：CSV 文件，首行为表头 `sender_name,text`，采用 UTF-8-SIG 编码，Excel 打开中文不乱码。
+- 默认带 2 空格缩进便于阅读；加 `--compact` 后输出单行 minified JSON，体积通常减到 1/3~1/2（`--compact` 仅对 JSON 生效，CSV 无影响）。
 - 同一昵称在不同群可能对应不同人，故 `--export` 必须配合 `--gid`；不确定昵称时先用 `--list-members --gid GID` 查。
-- `--sender-name` 与 `--sender-id` 至少给一个，可同时给（取交集）；0 条结果也会写出合法 JSON（空 `[]`）并在控制台提示。
+- `--sender-name` 与 `--sender-id` 至少给一个，可同时给（取交集）；0 条结果也会写出合法 JSON（`[]`）或 CSV（仅表头）并在控制台提示。
 
 ---
 

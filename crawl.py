@@ -281,10 +281,10 @@ def _do_list_members(db_path: str, gid: int, log: logging.Logger):
 
 
 def _do_export(db_path: str, gid: int, sender_name: str, sender_id: int,
-               since: str, until: str, output: str, compact: bool, log: logging.Logger):
-    """导出指定群内某成员本人发言为 JSON 文件（用于 AI 分析）。
+               since: str, until: str, output: str, compact: bool, fmt: str, log: logging.Logger):
+    """导出指定群内某成员本人发言为文件（JSON 或 CSV，用于 AI 分析）。
 
-    参数校验后委托 weibo_im.export 模块完成 DB 查询、JSON 组装、文件写入。
+    参数校验后委托 weibo_im.export 模块完成 DB 查询、数据组装、文件写入。
     """
     if not gid:
         log.error("--export 需要配合 --gid 指定群")
@@ -305,6 +305,7 @@ def _do_export(db_path: str, gid: int, sender_name: str, sender_id: int,
         since_ms=since_ms, until_ms=until_ms,
         output_path=output or None,
         compact=compact,
+        fmt=fmt,
     )
 
     count = result["count"]
@@ -363,6 +364,8 @@ def main():
                         help="--export 的输出文件路径（默认 项目目录/export_<gid>_<sender>.json）")
     parser.add_argument("--compact", action="store_true",
                         help="--export 时输出紧凑（minified）JSON，去掉缩进与多余空白，减小文件体积")
+    parser.add_argument("--format", choices=["json", "csv"], default="json",
+                        help="--export 的输出格式：json（默认，纯数组）或 csv（表头 sender_name,text）")
     args = parser.parse_args()
 
     level = logging.DEBUG if args.verbose else logging.INFO
@@ -463,7 +466,7 @@ def main():
 
     if args.export:
         _do_export(db_path, args.gid, args.sender_name, args.sender_id,
-                   args.since, args.until, args.output, args.compact, log)
+                   args.since, args.until, args.output, args.compact, args.format, log)
         return
 
     try:

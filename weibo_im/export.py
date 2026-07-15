@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import csv
 import json
 import logging
 from datetime import datetime, timezone, timedelta
@@ -131,14 +132,17 @@ def export_member_messages(
     until_ms: int | None = None,
     output_path: str | None = None,
     compact: bool = False,
+    fmt: str = "json",
 ) -> dict:
-    """导出指定群内某成员本人发言为 JSON 文件。
+    """导出指定群内某成员本人发言为文件（JSON 或 CSV）。
 
-    完整流程：初始化 DB 连接 → 查询消息 → 查询群名 → 组装 JSON → 写入文件。
+    完整流程：初始化 DB 连接 → 查询消息 → 查询群名 → 组装数据 → 写入文件。
 
-    compact=True 时输出紧凑（minified）JSON：去掉缩进与多余空白、字段间
-    无空格，显著减小文件体积，适合直接喂给大模型或网络传输；默认 False
-    保留 2 空格缩进，便于人工阅读。
+    fmt="json"（默认）：输出纯 JSON 数组，每条含 sender_name / text 两项。
+        compact=True 时进一步输出紧凑（minified）JSON（去缩进、去空格），
+        显著减小体积，适合直接喂大模型或网络传输；否则保留 2 空格缩进便于阅读。
+    fmt="csv"：输出 CSV 文件，表头为 sender_name,text（UTF-8-SIG 编码，
+        Excel 可直接打开且中文不乱码）；compact 参数对 CSV 无影响。
 
     返回结果字典:
         {"path": str,          # 输出文件路径
@@ -168,21 +172,28 @@ def export_member_messages(
             group_name = g.get("name", "")
             break
 
-    payload = build_export_json(rows)
+    msgs = build_export_json(rows)
 
-    # 确定输出路径
+    # 确定输出路径（CSV 用 .csv 扩展名）
     if not output_path:
         sender_slug = sname or (str(sid) if sid else "member")
         safe = "".join(c for c in sender_slug if c.isalnum() or c in "._-") or "member"
-        output_path = str(Path(__file__).resolve().parent.parent / f"export_{gid}_{safe}.json")
+        ext = "csv" if fmt == "csv" else "json"
+        output_path = str(Path(__file__).resolve().parent.parent / f"export_{gid}_{safe}.{ext}")
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        if compact:
-            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
-        else:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+    if fmt == "csv":
+        with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["sender_name", "text"])
+            writer.writeheader()
+            for m in msgs:
+                writer.writerow(m)
+    else:
+        with open(output_path, "w", encoding="utf-8") as f:
+            if compact:
+                json.dump(msgs, f, ensure_ascii=False, separators=(",", ":"))
+            else:
+                json.dump(msgs, f, ensure_ascii=False, indent=2)
 
-    msgs = payload
     start_cst = ms_to_cst(rows[0].get("created_at")) if rows else ""
     end_cst = ms_to_cst(rows[-1].get("created_at")) if rows else ""
 
